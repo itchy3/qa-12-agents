@@ -81,6 +81,8 @@ def run(context):
     rules_risk = context.get('rules_lawyer_result', {}).get('risk', 'Low')
 
     blocking_issues = [issue for issue in issues if _is_blocking_issue(issue)]
+    llm_disputed_blocking_issues = [issue for issue in blocking_issues if issue.get('llm_disputed')]
+    undisputed_blocking_issues = [issue for issue in blocking_issues if not issue.get('llm_disputed')]
     meaning_issues = [issue for issue in issues if _is_meaning_issue(issue)]
     im_not_ai_pass = im_not_ai.get('status') not in {'rejected_rule_or_meaning_risk'}
     rules_lawyer_pass = rules_risk not in {'Medium', 'High'} and not any(
@@ -103,6 +105,8 @@ def run(context):
         'blocking_issue_pass': not blocking_issues,
         'blocking_issue_count': len(blocking_issues),
         'blocking_issue_ids': [issue.get('issue_id') for issue in blocking_issues],
+        'llm_disputed_blocking_issue_ids': [issue.get('issue_id') for issue in llm_disputed_blocking_issues],
+        'undisputed_blocking_issue_ids': [issue.get('issue_id') for issue in undisputed_blocking_issues],
         'meaning_issue_ids': [issue.get('issue_id') for issue in meaning_issues],
         'terminology_pass': not any(x.get('severity') == 'Major' and 'Terminology' in x.get('issue_type', '') for x in issues),
         'syntax_pattern_pass': has_fix or not any(x.get('severity') == 'Major' and 'Syntax' in x.get('issue_type', '') for x in issues),

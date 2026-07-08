@@ -146,9 +146,34 @@ def _detect_scope_qualifier_risks(context: dict[str, Any], issues: list[dict[str
         })
 
 
+def _apply_llm_issue_review(issues: list[dict[str, Any]], issue_reviews: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    applied: list[dict[str, Any]] = []
+    by_id = {issue.get('issue_id'): issue for issue in issues}
+    for review in issue_reviews or []:
+        issue_id = review.get('issue_id')
+        issue = by_id.get(issue_id)
+        if not issue:
+            continue
+        verdict = str(review.get('llm_verdict') or '').lower()
+        confidence = float(review.get('confidence') or 0)
+        if verdict in {'false_positive_candidate', 'not_a_problem', 'safe'} and confidence >= 0.75:
+            issue['llm_disputed'] = True
+            issue['review_status'] = 'llm_disputed_false_positive_candidate'
+            issue['llm_issue_review'] = {
+                'llm_verdict': review.get('llm_verdict'),
+                'confidence': confidence,
+                'evidence': review.get('evidence'),
+                'recommended_action': review.get('recommended_action') or 'downgrade_to_human_review',
+                'requires_human_approval': review.get('requires_human_approval', True),
+            }
+            applied.append({'issue_id': issue_id, **issue['llm_issue_review']})
+    return applied
+
+
 def _llm_rules_lawyer(context: dict) -> dict | None:
     schema = {
         'issues': [{'issue_id': '...', 'issue_type': '...', 'severity': 'Major|Critical|Minor|StyleWarning', 'evidence': '...', 'blocks_approval': True}],
+        'issue_review': [{'issue_id': 'existing issue id', 'llm_verdict': 'false_positive_candidate|confirmed|unknown', 'confidence': '0..1', 'evidence': '...', 'recommended_action': 'downgrade_to_human_review', 'requires_human_approval': True}],
         'rules_lawyer_result': {'risk': 'Low|Medium|High', 'scope_checks': [], 'modal_checks': []},
     }
     prompt = build_prompt(
@@ -168,9 +193,11 @@ def run(context):
     _detect_target_scope_risks(context, issues)
     _detect_scope_qualifier_risks(context, issues)
     llm_data = _llm_rules_lawyer(context)
+    llm_dispute_reviews: list[dict[str, Any]] = []
     if llm_data:
         for issue in llm_data.get('issues') or []:
             _add_issue_once(issues, issue)
+        llm_dispute_reviews = _apply_llm_issue_review(issues, llm_data.get('issue_review') or [])
     context['facts']['issues'] = issues
 
     major = [x for x in issues if x.get('severity') == 'Major']
@@ -189,7 +216,9 @@ def run(context):
             'modal_check_count': len(modal_checks),
             'scope_check_count': len(scope_checks),
             'new_rules_lawyer_issue_count': len([i for i in issues if str(i.get('issue_id', '')).startswith(f"{context.get('code', 'CARD')}-REG_") or '-LLM_' in str(i.get('issue_id', ''))]),
+            'llm_disputed_issue_count': len(llm_dispute_reviews),
         },
+        'llm_issue_review': llm_dispute_reviews,
         'notes': 'XP omission/icon form/conditional position policies applied; not treated as issues by themselves.'
     }
     if llm_data and llm_data.get('rules_lawyer_result'):

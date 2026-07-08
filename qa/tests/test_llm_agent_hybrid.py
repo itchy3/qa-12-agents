@@ -26,6 +26,100 @@ if not RUNS_ROOT.exists() and '.hermes' in RUNNER.parts:
 
 
 class LlmAgentHybridTests(unittest.TestCase):
+    def test_llm_disputes_existing_blocker_without_auto_deleting_it(self):
+        run_id = 'TEST_LLM_DISPUTED_BLOCKER'
+        out = RUNS_ROOT / run_id
+        if out.exists():
+            shutil.rmtree(out)
+        fake = {
+            'source-meaning-checker': {
+                'source_analysis': {
+                    'mode': 'llm_json',
+                    'semantic_pattern': 'SAME_ACTOR_OPTIONAL_RECOVERY',
+                    'source_slots': {'actor': 'that adventurer', 'modal': 'may', 'target_scope': 'same actor only'},
+                    'confidence': 0.92,
+                    'unknowns': [],
+                    'needs_human_pattern_review': False,
+                },
+                'translation_slot_result': {
+                    'mode': 'llm_json',
+                    'ko_slots': {'actor': 'that adventurer', 'modal': 'may', 'target_scope': 'same actor only'},
+                    'slot_issues': [],
+                },
+            },
+            'rules-lawyer': {
+                'issues': [],
+                'issue_review': [
+                    {
+                        'issue_id': 'CARD_001-REG_TARGET_SCOPE_BROADENED',
+                        'llm_verdict': 'false_positive_candidate',
+                        'confidence': 0.91,
+                        'evidence': 'LLM review says current_ko preserves the same acting adventurer in context.',
+                        'recommended_action': 'downgrade_to_human_review',
+                        'requires_human_approval': True,
+                    }
+                ],
+                'rules_lawyer_result': {
+                    'risk': 'Low',
+                    'scope_checks': [],
+                    'modal_checks': [],
+                },
+            },
+            'korean-editor': {
+                'translation_comparison': {
+                    'status': 'compared',
+                    'winner': 'current_ko',
+                    'candidate_decision': 'tie_keep_current',
+                    'meaning_delta': 'none_detected_by_llm',
+                    'rule_delta': 'none_detected_by_llm',
+                    'style_delta': 'none',
+                    'safe_to_apply': False,
+                    'requires_human_review': True,
+                },
+                'im_not_ai_result': {
+                    'status': 'not_selected',
+                    'meaning_preserved': True,
+                    'meaning_structure_preserved': True,
+                    'register_preserved': True,
+                    'candidate_decision': 'tie_keep_current',
+                    'requires_human_review': True,
+                    'checks': [],
+                },
+            },
+            'verifier': {
+                'self_verification_patch': {
+                    'llm_semantic_review': 'The only blocker is disputed by LLM and requires human approval.',
+                    'needs_human_review': True,
+                }
+            },
+            'qa-reviewer': {
+                'qa_reviewer_patch': {
+                    'llm_review_summary': 'Do not auto-pass; route disputed blocker to human review.',
+                    'needs_human_review': True,
+                }
+            },
+        }
+        env = os.environ.copy()
+        env['QA_LLM_ENABLED'] = '1'
+        env['QA_LLM_FAKE_RESPONSES_JSON'] = json.dumps(fake, ensure_ascii=False)
+        result = subprocess.run(
+            [sys.executable, str(RUNNER), '--run-id', run_id, '--input-json', str(TEMPLATE)],
+            cwd=str(PROJECT),
+            text=True,
+            capture_output=True,
+            env=env,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        qa = json.loads((out / 'output' / 'qa_json' / 'CARD_001.qa.json').read_text(encoding='utf-8'))
+        issue = next(i for i in qa['issues'] if i['issue_id'] == 'CARD_001-REG_TARGET_SCOPE_BROADENED')
+        self.assertTrue(issue.get('llm_disputed'))
+        self.assertEqual(issue.get('review_status'), 'llm_disputed_false_positive_candidate')
+        self.assertEqual(qa['verdict'], 'Human review')
+        self.assertTrue(qa['requires_human_review'])
+        self.assertEqual(qa['qa_reviewer_result']['final_decision_basis'], 'llm_disputed_blocker_human_review')
+        self.assertIn('CARD_001-REG_TARGET_SCOPE_BROADENED', qa['qa_reviewer_result']['llm_disputed_blocking_issue_ids'])
+        self.assertTrue(any(p.get('route') == 'false_positive_review' for p in qa['learning_update_proposal']))
+
     def test_core_agents_use_compact_llm_json_when_enabled(self):
         run_id = 'TEST_LLM_AGENT_HYBRID'
         out = RUNS_ROOT / run_id

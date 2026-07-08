@@ -72,6 +72,18 @@ def run(context):
         context['verdict'] = context['facts']['verdict']
     context['requires_human_review'] = requires
     self_verification = context.get('self_verification') or {}
+    llm_disputed_blocking_issue_ids = self_verification.get('llm_disputed_blocking_issue_ids') or [
+        issue.get('issue_id') for issue in issues
+        if issue.get('severity') in ['Critical', 'Major'] and issue.get('llm_disputed')
+    ]
+    undisputed_blocking_issue_ids = self_verification.get('undisputed_blocking_issue_ids') or [
+        issue.get('issue_id') for issue in issues
+        if issue.get('severity') in ['Critical', 'Major'] and not issue.get('llm_disputed')
+    ]
+    if has_blocking_major and not has_critical and llm_disputed_blocking_issue_ids and not undisputed_blocking_issue_ids:
+        context['score'] = min(max(context['facts'].get('score', 85), 85), 89)
+        context['verdict'] = 'Human review'
+        context['requires_human_review'] = True
     blocking_issue_ids = self_verification.get('blocking_issue_ids') or [
         issue.get('issue_id') for issue in issues
         if issue.get('severity') in ['Critical', 'Major']
@@ -83,6 +95,8 @@ def run(context):
     candidate_decision = self_verification.get('candidate_decision') or context.get('translation_comparison', {}).get('candidate_decision')
     if has_critical:
         final_decision_basis = 'critical_issue'
+    elif has_blocking_major and llm_disputed_blocking_issue_ids and not undisputed_blocking_issue_ids:
+        final_decision_basis = 'llm_disputed_blocker_human_review'
     elif has_blocking_major or self_verification.get('blocking_issue_pass') is False:
         final_decision_basis = 'blocking_issue'
     elif candidate_decision == 'rejected_keep_current' and 'im_not_ai_pass' in self_verification_warnings and context['verdict'] == 'Pass':
@@ -95,6 +109,22 @@ def run(context):
         final_decision_basis = 'all_gates_passed'
     proposals = []
     for issue in issues:
+        if issue.get('llm_disputed'):
+            review = issue.get('llm_issue_review') or {}
+            proposals.append({
+                'type': 'false_positive_review',
+                'route': 'false_positive_review',
+                'test_id': None,
+                'issue_id': issue['issue_id'],
+                'proposal': review.get('evidence') or 'LLM disputes this deterministic blocker; human approval required before suppressing it.',
+                'card_fix': None,
+                'source_item_id': context['item_id'],
+                'requires_human_approval': True,
+                'llm_verdict': review.get('llm_verdict'),
+                'confidence': review.get('confidence'),
+                'recommended_action': review.get('recommended_action') or 'downgrade_to_human_review',
+            })
+            continue
         route = classify_learning_route(issue)
         proposals.append({
             'type': route['proposal_type'],
@@ -231,6 +261,8 @@ def run(context):
         'final_decision_basis': final_decision_basis,
         'requires_human_review': context['requires_human_review'],
         'blocking_issue_ids': blocking_issue_ids,
+        'llm_disputed_blocking_issue_ids': llm_disputed_blocking_issue_ids,
+        'undisputed_blocking_issue_ids': undisputed_blocking_issue_ids,
         'self_verification_warnings': self_verification_warnings,
         'candidate_decision': candidate_decision,
         'proposal_count': len(proposals),

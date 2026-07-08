@@ -65,6 +65,15 @@ Core LLM-capable agents:
 
 Each LLM agent receives a compact card payload, not the full rulebook/glossary/run history. Outputs must be strict JSON and include confidence/UNKNOWN/human-review signals where applicable. Results are recorded in each QA JSON under `llm_usage`.
 
+LLM dispute policy:
+
+- LLM agents may add new grounded issues.
+- LLM agents may also return `issue_review[]` for existing deterministic issues.
+- A high-confidence LLM `false_positive_candidate` does **not** delete the deterministic issue.
+- Instead, the issue is annotated with `llm_disputed=true`, `review_status=llm_disputed_false_positive_candidate`, and an `llm_issue_review` evidence object.
+- If every blocking issue is LLM-disputed and no undisputed blocker remains, the final verdict becomes `Human review`, not `Pass`.
+- Human approval is still required before suppressing or promoting the false-positive lesson.
+
 OpenAI-compatible setup:
 
 ```bash
