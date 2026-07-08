@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any
 from .shared import record_agent
+from llm_client import build_prompt, call_json, compact_card_payload, record_usage
 
 AGENT_NAME = 'source-meaning-checker'
 
@@ -104,7 +105,54 @@ def _confidence(mode: str, quality: dict) -> float:
     return 0.68 if mode == 'parser_extracted' else 0.74
 
 
+def _llm_source_meaning(context: dict) -> dict | None:
+    schema = {
+        'source_analysis': {
+            'mode': 'llm_json',
+            'semantic_pattern': 'string or UNKNOWN',
+            'source_slots': {'actor': '...', 'action': '...', 'target_scope': '...'},
+            'confidence': '0..1',
+            'unknowns': [],
+            'needs_human_pattern_review': False,
+        },
+        'translation_slot_result': {
+            'mode': 'llm_json',
+            'ko_slots': {},
+            'slot_issues': [],
+        },
+    }
+    prompt = build_prompt(
+        AGENT_NAME,
+        'Extract compact semantic slots from source_text and current_ko. Focus on actor, action, target, target_scope, timing, condition, modal force, numbers, icons/markup, and UNKNOWNs.',
+        compact_card_payload(context, include_upstream=False),
+        schema,
+    )
+    result = call_json(AGENT_NAME, prompt, expected_keys=['source_analysis', 'translation_slot_result'])
+    record_usage(context, AGENT_NAME, result['usage'])
+    return result.get('data')
+
+
 def run(context):
+    llm_data = _llm_source_meaning(context)
+    if llm_data:
+        source_analysis = dict(llm_data.get('source_analysis') or {})
+        translation_slot_result = dict(llm_data.get('translation_slot_result') or {})
+        source_analysis.setdefault('mode', 'llm_json')
+        source_analysis.setdefault('semantic_pattern', 'UNKNOWN')
+        source_analysis.setdefault('source_slots', {})
+        source_analysis.setdefault('unknowns', [])
+        source_analysis.setdefault('needs_human_pattern_review', bool(source_analysis.get('unknowns')))
+        source_analysis.setdefault('source_analysis_quality', {'slot_richness': 'llm_structured', 'warnings': []})
+        translation_slot_result.setdefault('mode', 'llm_json')
+        translation_slot_result.setdefault('ko_slots', {})
+        translation_slot_result.setdefault('slot_issues', [])
+        context['source_analysis'] = source_analysis
+        context['translation_slot_result'] = translation_slot_result
+        context['expected_seed_slots'] = context['facts'].get('expected_seed_slots')
+        context['slot_extraction_quality'] = context['facts'].get('slot_extraction_quality')
+        context['source_quality_issues'] = context['facts'].get('source_quality_issues', [])
+        return record_agent(context, AGENT_NAME, {'summary': f"llm_json semantic slots recorded; confidence={source_analysis.get('confidence')}"})
+
     facts = context['facts']
     mode = _mode_for(facts)
     source_slots = facts['source_slots']

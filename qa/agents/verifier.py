@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 
 from .shared import record_agent
+from llm_client import build_prompt, call_json, compact_card_payload, record_usage
 
 AGENT_NAME = 'verifier'
 
@@ -52,6 +53,25 @@ def _markup_pass(context: dict, im_not_ai: dict) -> bool:
     return _markup_tokens(current) == _markup_tokens(final)
 
 
+def _llm_verifier(context: dict) -> dict | None:
+    schema = {
+        'self_verification_patch': {
+            'llm_semantic_review': 'short grounded review',
+            'meaning_preserved': 'optional boolean advisory',
+            'needs_human_review': 'optional boolean',
+        }
+    }
+    prompt = build_prompt(
+        AGENT_NAME,
+        'Audit upstream artifacts for contradictions. Do not translate. Check whether meaning, rules-lawyer, im-not-ai, markup, and blocking issue gates are consistent. Return a patch/advisory only; deterministic gates remain authoritative.',
+        compact_card_payload(context),
+        schema,
+    )
+    result = call_json(AGENT_NAME, prompt, expected_keys=['self_verification_patch'])
+    record_usage(context, AGENT_NAME, result['usage'])
+    return result.get('data')
+
+
 def run(context):
     issues = context['facts'].get('issues', [])
     has_fix = bool(context.get('suggested_ko')) and context.get('suggested_ko') not in ['현행 유지 가능.', '사람 검토 필요']
@@ -97,6 +117,11 @@ def run(context):
         # Legacy compatibility: verifier itself does not create issues; issue_count/blocking_issue_ids carry the useful signal.
         'new_issue_created': False,
     }
+    llm_data = _llm_verifier(context)
+    if llm_data and llm_data.get('self_verification_patch'):
+        context['self_verification']['llm_advisory'] = llm_data['self_verification_patch']
+        if llm_data['self_verification_patch'].get('needs_human_review') is True:
+            context['self_verification']['llm_needs_human_review'] = True
     failed = [k for k, v in context['self_verification'].items() if k.endswith('_pass') and v is False]
     summary = 'self-verification passed' if not failed and meaning_preserved else f"self-verification failed: {', '.join(failed) or 'meaning_preserved'}"
     return record_agent(context, AGENT_NAME, {'summary': summary})

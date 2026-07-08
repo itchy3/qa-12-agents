@@ -1,5 +1,6 @@
 from __future__ import annotations
 from .shared import record_agent
+from llm_client import build_prompt, call_json, compact_card_payload, record_usage
 AGENT_NAME = 'qa-reviewer'
 
 
@@ -28,6 +29,25 @@ def classify_learning_route(issue: dict) -> dict:
     if 'unresolved' in text:
         return {'route': 'parser_rule', 'test_id': 'REG_UNRESOLVED_PATTERN_REQUIRES_SLOT_RULE', 'proposal_type': 'parser_rule', 'proposal': 'Promote unresolved source pattern to parser slot rule after human review.'}
     return {'route': 'card_fix', 'test_id': None, 'proposal_type': 'card_fix', 'proposal': issue.get('suggested_fix') or 'Review card-specific fix.'}
+
+
+def _llm_qa_reviewer(context: dict) -> dict | None:
+    schema = {
+        'qa_reviewer_patch': {
+            'llm_review_summary': 'short final synthesis',
+            'final_decision_basis': 'optional basis string',
+            'needs_human_review': 'optional boolean',
+        }
+    }
+    prompt = build_prompt(
+        AGENT_NAME,
+        'Synthesize final QA posture from issues, rules-lawyer, verifier, and candidate decision. Do not invent new facts. Explain why the verdict requires revision, human review, or pass. Return patch/advisory only.',
+        compact_card_payload(context),
+        schema,
+    )
+    result = call_json(AGENT_NAME, prompt, expected_keys=['qa_reviewer_patch'])
+    record_usage(context, AGENT_NAME, result['usage'])
+    return result.get('data')
 
 
 def run(context):
@@ -216,4 +236,13 @@ def run(context):
         'proposal_count': len(proposals),
         'proposal_routes': sorted({p.get('route') for p in proposals if p.get('route')}),
     }
+    llm_data = _llm_qa_reviewer(context)
+    if llm_data and llm_data.get('qa_reviewer_patch'):
+        patch = dict(llm_data['qa_reviewer_patch'])
+        if patch.get('final_decision_basis'):
+            context['qa_reviewer_result']['final_decision_basis'] = patch['final_decision_basis']
+        if patch.get('needs_human_review') is True:
+            context['requires_human_review'] = True
+            context['qa_reviewer_result']['requires_human_review'] = True
+        context['qa_reviewer_result']['llm_advisory'] = patch
     return record_agent(context, AGENT_NAME, {'summary': f"{context['verdict']} score={context['score']} proposals={len(proposals)}"})

@@ -42,6 +42,56 @@ Run smoke tests:
 ```bash
 python3 -m unittest discover -s qa/tests -p 'test_public_*.py'
 python3 qa/tests/test_rulebook_preflight_index.py
+python3 qa/tests/test_llm_agent_hybrid.py
+```
+
+## Optional compact LLM JSON agents
+
+The harness is hybrid by design:
+
+```text
+deterministic preflight/retrieval + compact LLM semantic agents + deterministic validators
+```
+
+LLM usage is optional and off by default. Without LLM configuration, the pipeline keeps using deterministic parser/checker fallbacks.
+
+Core LLM-capable agents:
+
+- `source-meaning-checker` — source/KO semantic slot extraction
+- `rules-lawyer` — modal, target/scope, timing, condition, number, exception checks
+- `korean-editor` — conservative non-AI cleanup evaluation/proposal, never auto-apply
+- `verifier` — advisory audit of upstream gate consistency
+- `qa-reviewer` — advisory final synthesis/routing
+
+Each LLM agent receives a compact card payload, not the full rulebook/glossary/run history. Outputs must be strict JSON and include confidence/UNKNOWN/human-review signals where applicable. Results are recorded in each QA JSON under `llm_usage`.
+
+OpenAI-compatible setup:
+
+```bash
+export QA_LLM_ENABLED=1
+export QA_LLM_API_KEY=...
+export QA_LLM_MODEL=gpt-4o-mini
+# optional; defaults to https://api.openai.com/v1
+export QA_LLM_BASE_URL=https://api.openai.com/v1
+python3 qa/scripts/run_agent_pipeline.py \
+  --run-id LLM_PASS1 \
+  --input-json templates/sample_cards.json
+```
+
+OpenRouter-style setup:
+
+```bash
+export QA_LLM_ENABLED=1
+export QA_LLM_API_KEY=$OPENROUTER_API_KEY
+export QA_LLM_BASE_URL=https://openrouter.ai/api/v1
+export QA_LLM_MODEL=openai/gpt-4o-mini
+```
+
+Test/fake mode for CI:
+
+```bash
+export QA_LLM_ENABLED=1
+export QA_LLM_FAKE_RESPONSES_JSON='{"source-meaning-checker":{"source_analysis":{"mode":"llm_json","semantic_pattern":"UNKNOWN","source_slots":{}},"translation_slot_result":{"mode":"llm_json","ko_slots":{},"slot_issues":[]}}}'
 ```
 
 ---

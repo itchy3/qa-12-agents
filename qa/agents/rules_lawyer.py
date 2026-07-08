@@ -4,6 +4,7 @@ import re
 from typing import Any
 
 from .shared import record_agent
+from llm_client import build_prompt, call_json, compact_card_payload, record_usage
 
 AGENT_NAME = 'rules-lawyer'
 
@@ -145,11 +146,31 @@ def _detect_scope_qualifier_risks(context: dict[str, Any], issues: list[dict[str
         })
 
 
+def _llm_rules_lawyer(context: dict) -> dict | None:
+    schema = {
+        'issues': [{'issue_id': '...', 'issue_type': '...', 'severity': 'Major|Critical|Minor|StyleWarning', 'evidence': '...', 'blocks_approval': True}],
+        'rules_lawyer_result': {'risk': 'Low|Medium|High', 'scope_checks': [], 'modal_checks': []},
+    }
+    prompt = build_prompt(
+        AGENT_NAME,
+        'Compare source slots, KO slots, source_text, current_ko, and relevant rulebook hits. Detect modal force, target scope, timing, condition, number, exception, and rule-scope mismatches. Return only grounded issues; use UNKNOWN/human review when unsure.',
+        compact_card_payload(context),
+        schema,
+    )
+    result = call_json(AGENT_NAME, prompt, expected_keys=['issues', 'rules_lawyer_result'])
+    record_usage(context, AGENT_NAME, result['usage'])
+    return result.get('data')
+
+
 def run(context):
     issues = list(context['facts'].get('issues', []))
     _detect_modal_force_risks(context, issues)
     _detect_target_scope_risks(context, issues)
     _detect_scope_qualifier_risks(context, issues)
+    llm_data = _llm_rules_lawyer(context)
+    if llm_data:
+        for issue in llm_data.get('issues') or []:
+            _add_issue_once(issues, issue)
     context['facts']['issues'] = issues
 
     major = [x for x in issues if x.get('severity') == 'Major']
@@ -164,10 +185,17 @@ def run(context):
         'modal_checks': modal_checks,
         'rules_lawyer_quality': {
             'direct_text_checks_enabled': True,
+            'llm_json_enabled': bool(llm_data),
             'modal_check_count': len(modal_checks),
             'scope_check_count': len(scope_checks),
-            'new_rules_lawyer_issue_count': len([i for i in issues if str(i.get('issue_id', '')).startswith(f"{context.get('code', 'CARD')}-REG_")]),
+            'new_rules_lawyer_issue_count': len([i for i in issues if str(i.get('issue_id', '')).startswith(f"{context.get('code', 'CARD')}-REG_") or '-LLM_' in str(i.get('issue_id', ''))]),
         },
         'notes': 'XP omission/icon form/conditional position policies applied; not treated as issues by themselves.'
     }
+    if llm_data and llm_data.get('rules_lawyer_result'):
+        llm_result = dict(llm_data['rules_lawyer_result'])
+        context['rules_lawyer_result']['risk'] = llm_result.get('risk') or context['rules_lawyer_result']['risk']
+        context['rules_lawyer_result']['scope_checks'].extend(llm_result.get('scope_checks') or [])
+        context['rules_lawyer_result']['modal_checks'].extend(llm_result.get('modal_checks') or [])
+        context['rules_lawyer_result']['llm_review'] = {k: v for k, v in llm_result.items() if k not in {'scope_checks', 'modal_checks'}}
     return record_agent(context, AGENT_NAME, {'summary': context['rules_lawyer_result']['risk']})

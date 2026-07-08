@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from .shared import record_agent
+from llm_client import build_prompt, call_json, compact_card_payload, record_usage
 
 AGENT_NAME = 'korean-editor'
 
@@ -279,6 +280,39 @@ def _compare_current_and_polished(context: dict) -> dict:
     }
 
 
+def _llm_korean_editor(context: dict) -> dict | None:
+    schema = {
+        'translation_comparison': {
+            'status': 'compared',
+            'winner': 'current_ko|polished_ko|tie_keep_current',
+            'candidate_decision': 'accept_polished_candidate|rejected_keep_current|no_candidate',
+            'meaning_delta': '...',
+            'rule_delta': '...',
+            'style_delta': '...',
+            'safe_to_apply': False,
+            'requires_human_review': True,
+        },
+        'im_not_ai_result': {
+            'status': 'accepted|rejected_rule_or_meaning_risk|not_selected|skipped_no_polished_ko',
+            'meaning_preserved': True,
+            'meaning_structure_preserved': True,
+            'register_preserved': True,
+            'candidate_decision': '...',
+            'checks': [],
+        },
+        'suggested_ko': 'optional conservative suggestion',
+    }
+    prompt = build_prompt(
+        AGENT_NAME,
+        'Evaluate or propose a conservative non-AI/Korean-naturalized candidate. Preserve source meaning, modal force, scope, timing, numbers, and markup. Never mark safe_to_apply true; route risky or unclear changes to human review.',
+        compact_card_payload(context),
+        schema,
+    )
+    result = call_json(AGENT_NAME, prompt, expected_keys=['translation_comparison', 'im_not_ai_result'])
+    record_usage(context, AGENT_NAME, result['usage'])
+    return result.get('data')
+
+
 def run(context):
     external_polished = context.get('polished_ko') or context.get('input_card', {}).get('polished_ko')
     candidate_source = 'input_polished_ko' if external_polished else 'none'
@@ -292,9 +326,23 @@ def run(context):
         else:
             context['polished_ko'] = None
     comparison = _compare_current_and_polished(context)
+    llm_data = _llm_korean_editor(context)
+    if llm_data:
+        llm_comparison = dict(llm_data.get('translation_comparison') or {})
+        llm_comparison.setdefault('safe_to_apply', False)
+        llm_comparison.setdefault('requires_human_review', True)
+        if llm_comparison:
+            comparison.update(llm_comparison)
     context['translation_comparison'] = comparison
-    context['im_not_ai_result'] = _build_im_not_ai_result(comparison, comparison.get('meaning_structure_checks', []), context.get('current_ko', ''), context.get('polished_ko'), candidate_source)
-    context['suggested_ko'] = context['facts'].get('suggested_ko', '수정 제안 없음')
+    im_not_ai = _build_im_not_ai_result(comparison, comparison.get('meaning_structure_checks', []), context.get('current_ko', ''), context.get('polished_ko'), candidate_source)
+    if llm_data and llm_data.get('im_not_ai_result'):
+        im_not_ai.update(dict(llm_data['im_not_ai_result']))
+        im_not_ai.setdefault('requires_human_review', True)
+    context['im_not_ai_result'] = im_not_ai
+    if llm_data and llm_data.get('suggested_ko') and not context.get('polished_ko'):
+        context['polished_ko'] = llm_data['suggested_ko']
+        candidate_source = 'llm_korean_editor'
+    context['suggested_ko'] = (llm_data or {}).get('suggested_ko') or context['facts'].get('suggested_ko', '수정 제안 없음')
 
     if comparison['status'] == 'skipped_no_polished_ko':
         context['final_translation'] = context['suggested_ko'] if context['facts'].get('verdict') != 'Pass' else '현행 유지 가능'
