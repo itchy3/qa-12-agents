@@ -132,6 +132,49 @@ def _llm_source_meaning(context: dict) -> dict | None:
     return result.get('data')
 
 
+def _build_semantic_ir(source_analysis: dict, translation_slot_result: dict, previous_pattern: str | None = None) -> dict:
+    source_ir = source_analysis.get('source_slots') or {}
+    ko_ir = translation_slot_result.get('ko_slots') or {}
+    semantic_pattern = source_analysis.get('semantic_pattern') or 'UNKNOWN'
+    mode = source_analysis.get('mode') or 'unknown'
+    llm_resolved = (
+        mode == 'llm_json'
+        and previous_pattern == 'UNRESOLVED'
+        and semantic_pattern not in {'UNKNOWN', 'UNRESOLVED'}
+        and not source_analysis.get('unknowns')
+        and float(source_analysis.get('confidence') or 0) >= 0.75
+    )
+    return {
+        'status': 'llm_resolved' if llm_resolved else ('unresolved' if semantic_pattern in {'UNKNOWN', 'UNRESOLVED'} else 'available'),
+        'mode': mode,
+        'semantic_pattern': semantic_pattern,
+        'source_ir': source_ir,
+        'ko_ir': ko_ir,
+        'confidence': source_analysis.get('confidence'),
+        'unknowns': source_analysis.get('unknowns') or [],
+        'previous_semantic_pattern': previous_pattern,
+        'requires_human_review': bool(source_analysis.get('needs_human_pattern_review')) or llm_resolved,
+    }
+
+
+def _downgrade_unresolved_if_llm_resolved(context: dict, semantic_ir: dict) -> None:
+    if semantic_ir.get('status') != 'llm_resolved':
+        return
+    for issue in context.get('facts', {}).get('issues', []):
+        if 'UNRESOLVED' not in str(issue.get('issue_id', '')) and issue.get('issue_type') != 'Unresolved semantic pattern':
+            continue
+        issue['issue_status'] = 'candidate'
+        issue['review_status'] = 'llm_resolved_unresolved_human_review'
+        issue['blocks_approval'] = False
+        issue['llm_resolved'] = True
+        issue['resolution_evidence'] = {
+            'semantic_ir_status': semantic_ir.get('status'),
+            'semantic_pattern': semantic_ir.get('semantic_pattern'),
+            'confidence': semantic_ir.get('confidence'),
+            'requires_human_approval': True,
+        }
+
+
 def run(context):
     llm_data = _llm_source_meaning(context)
     if llm_data:
@@ -148,6 +191,8 @@ def run(context):
         translation_slot_result.setdefault('slot_issues', [])
         context['source_analysis'] = source_analysis
         context['translation_slot_result'] = translation_slot_result
+        context['semantic_ir'] = _build_semantic_ir(source_analysis, translation_slot_result, context['facts'].get('semantic_pattern'))
+        _downgrade_unresolved_if_llm_resolved(context, context['semantic_ir'])
         context['expected_seed_slots'] = context['facts'].get('expected_seed_slots')
         context['slot_extraction_quality'] = context['facts'].get('slot_extraction_quality')
         context['source_quality_issues'] = context['facts'].get('source_quality_issues', [])
@@ -174,6 +219,7 @@ def run(context):
         'ko_slots': facts['ko_slots'],
         'slot_issues': [x for x in facts.get('issues', []) if x.get('severity') in ['Critical', 'Major']],
     }
+    context['semantic_ir'] = _build_semantic_ir(context['source_analysis'], context['translation_slot_result'], facts.get('semantic_pattern'))
     context['expected_seed_slots'] = facts.get('expected_seed_slots')
     context['slot_extraction_quality'] = facts.get('slot_extraction_quality')
     context['source_quality_issues'] = facts.get('source_quality_issues', [])

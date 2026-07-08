@@ -76,11 +76,19 @@ def run(context):
         issue.get('issue_id') for issue in issues
         if issue.get('severity') in ['Critical', 'Major'] and issue.get('llm_disputed')
     ]
+    weak_evidence_blocking_issue_ids = self_verification.get('weak_evidence_blocking_issue_ids') or [
+        issue.get('issue_id') for issue in issues
+        if issue.get('severity') in ['Critical', 'Major'] and issue.get('review_status') == 'weak_evidence_human_review'
+    ]
+    llm_resolved_unresolved_issue_ids = self_verification.get('llm_resolved_unresolved_issue_ids') or [
+        issue.get('issue_id') for issue in issues
+        if issue.get('severity') in ['Critical', 'Major'] and issue.get('review_status') == 'llm_resolved_unresolved_human_review'
+    ]
     undisputed_blocking_issue_ids = self_verification.get('undisputed_blocking_issue_ids') or [
         issue.get('issue_id') for issue in issues
-        if issue.get('severity') in ['Critical', 'Major'] and not issue.get('llm_disputed')
+        if issue.get('severity') in ['Critical', 'Major'] and not issue.get('llm_disputed') and issue.get('review_status') not in {'weak_evidence_human_review', 'llm_resolved_unresolved_human_review'}
     ]
-    if has_blocking_major and not has_critical and llm_disputed_blocking_issue_ids and not undisputed_blocking_issue_ids:
+    if has_blocking_major and not has_critical and not undisputed_blocking_issue_ids and (llm_disputed_blocking_issue_ids or weak_evidence_blocking_issue_ids or llm_resolved_unresolved_issue_ids):
         context['score'] = min(max(context['facts'].get('score', 85), 85), 89)
         context['verdict'] = 'Human review'
         context['requires_human_review'] = True
@@ -95,6 +103,10 @@ def run(context):
     candidate_decision = self_verification.get('candidate_decision') or context.get('translation_comparison', {}).get('candidate_decision')
     if has_critical:
         final_decision_basis = 'critical_issue'
+    elif has_blocking_major and llm_resolved_unresolved_issue_ids and not undisputed_blocking_issue_ids:
+        final_decision_basis = 'llm_resolved_unresolved_human_review'
+    elif has_blocking_major and weak_evidence_blocking_issue_ids and not undisputed_blocking_issue_ids:
+        final_decision_basis = 'weak_evidence_blocker_human_review'
     elif has_blocking_major and llm_disputed_blocking_issue_ids and not undisputed_blocking_issue_ids:
         final_decision_basis = 'llm_disputed_blocker_human_review'
     elif has_blocking_major or self_verification.get('blocking_issue_pass') is False:
@@ -109,6 +121,32 @@ def run(context):
         final_decision_basis = 'all_gates_passed'
     proposals = []
     for issue in issues:
+        if issue.get('review_status') == 'llm_resolved_unresolved_human_review':
+            proposals.append({
+                'type': 'Semantic IR Review',
+                'route': 'semantic_ir_review',
+                'test_id': None,
+                'issue_id': issue['issue_id'],
+                'proposal': 'LLM semantic IR resolved an unresolved parser pattern; human approval required before suppressing this unresolved class.',
+                'card_fix': None,
+                'source_item_id': context['item_id'],
+                'requires_human_approval': True,
+                'semantic_ir_status': context.get('semantic_ir', {}).get('status'),
+            })
+            continue
+        if issue.get('review_status') == 'weak_evidence_human_review':
+            proposals.append({
+                'type': 'Weak Evidence Issue Review',
+                'route': 'issue_evidence_review',
+                'test_id': None,
+                'issue_id': issue['issue_id'],
+                'proposal': issue.get('adjudication_note') or 'Issue lacks sufficient source span, KO span, or semantic diff evidence.',
+                'card_fix': None,
+                'source_item_id': context['item_id'],
+                'requires_human_approval': True,
+                'evidence_quality': issue.get('evidence_quality'),
+            })
+            continue
         if issue.get('llm_disputed'):
             review = issue.get('llm_issue_review') or {}
             proposals.append({
@@ -262,6 +300,8 @@ def run(context):
         'requires_human_review': context['requires_human_review'],
         'blocking_issue_ids': blocking_issue_ids,
         'llm_disputed_blocking_issue_ids': llm_disputed_blocking_issue_ids,
+        'weak_evidence_blocking_issue_ids': weak_evidence_blocking_issue_ids,
+        'llm_resolved_unresolved_issue_ids': llm_resolved_unresolved_issue_ids,
         'undisputed_blocking_issue_ids': undisputed_blocking_issue_ids,
         'self_verification_warnings': self_verification_warnings,
         'candidate_decision': candidate_decision,

@@ -53,6 +53,30 @@ def _markup_pass(context: dict, im_not_ai: dict) -> bool:
     return _markup_tokens(current) == _markup_tokens(final)
 
 
+def _issue_has_sufficient_evidence(issue: dict) -> bool:
+    if issue.get('llm_disputed') or issue.get('review_status') == 'llm_resolved_unresolved_human_review':
+        return True
+    semantic_diff = issue.get('semantic_diff')
+    has_source_span = bool(issue.get('span_source') or issue.get('source_span'))
+    has_ko_span_or_missing = bool(issue.get('span_ko') or issue.get('ko_span') or (isinstance(semantic_diff, dict) and semantic_diff.get('ko_value') == 'missing'))
+    return bool(semantic_diff and has_source_span and has_ko_span_or_missing)
+
+
+def _adjudicate_issue_evidence(issues: list[dict]) -> None:
+    for issue in issues:
+        if not _is_blocking_issue(issue):
+            continue
+        if _issue_has_sufficient_evidence(issue):
+            issue.setdefault('issue_status', 'confirmed')
+            issue.setdefault('evidence_quality', 'sufficient')
+            continue
+        issue['issue_status'] = 'candidate'
+        issue['evidence_quality'] = 'weak'
+        issue['review_status'] = 'weak_evidence_human_review'
+        issue['blocks_approval'] = False
+        issue.setdefault('adjudication_note', 'Blocking issue lacks source span, KO span/missing marker, or semantic_diff; route to human review instead of final blocker.')
+
+
 def _llm_verifier(context: dict) -> dict | None:
     schema = {
         'self_verification_patch': {
@@ -74,6 +98,7 @@ def _llm_verifier(context: dict) -> dict | None:
 
 def run(context):
     issues = context['facts'].get('issues', [])
+    _adjudicate_issue_evidence(issues)
     has_fix = bool(context.get('suggested_ko')) and context.get('suggested_ko') not in ['현행 유지 가능.', '사람 검토 필요']
     ontology_status = context.get('ontology_result', {}).get('status')
     patch_status = context.get('patch_result', {}).get('status')
@@ -82,7 +107,9 @@ def run(context):
 
     blocking_issues = [issue for issue in issues if _is_blocking_issue(issue)]
     llm_disputed_blocking_issues = [issue for issue in blocking_issues if issue.get('llm_disputed')]
-    undisputed_blocking_issues = [issue for issue in blocking_issues if not issue.get('llm_disputed')]
+    weak_evidence_blocking_issues = [issue for issue in blocking_issues if issue.get('review_status') == 'weak_evidence_human_review']
+    llm_resolved_unresolved_issues = [issue for issue in blocking_issues if issue.get('review_status') == 'llm_resolved_unresolved_human_review']
+    undisputed_blocking_issues = [issue for issue in blocking_issues if not issue.get('llm_disputed') and issue.get('review_status') not in {'weak_evidence_human_review', 'llm_resolved_unresolved_human_review'}]
     meaning_issues = [issue for issue in issues if _is_meaning_issue(issue)]
     im_not_ai_pass = im_not_ai.get('status') not in {'rejected_rule_or_meaning_risk'}
     rules_lawyer_pass = rules_risk not in {'Medium', 'High'} and not any(
@@ -106,6 +133,8 @@ def run(context):
         'blocking_issue_count': len(blocking_issues),
         'blocking_issue_ids': [issue.get('issue_id') for issue in blocking_issues],
         'llm_disputed_blocking_issue_ids': [issue.get('issue_id') for issue in llm_disputed_blocking_issues],
+        'weak_evidence_blocking_issue_ids': [issue.get('issue_id') for issue in weak_evidence_blocking_issues],
+        'llm_resolved_unresolved_issue_ids': [issue.get('issue_id') for issue in llm_resolved_unresolved_issues],
         'undisputed_blocking_issue_ids': [issue.get('issue_id') for issue in undisputed_blocking_issues],
         'meaning_issue_ids': [issue.get('issue_id') for issue in meaning_issues],
         'terminology_pass': not any(x.get('severity') == 'Major' and 'Terminology' in x.get('issue_type', '') for x in issues),

@@ -67,12 +67,16 @@ Each LLM agent receives a compact card payload, not the full rulebook/glossary/r
 
 LLM dispute policy:
 
+- The pipeline now emits a first-class `semantic_ir` artifact with `source_ir`, `ko_ir`, `status`, confidence, unknowns, and prior parser pattern.
+- `source-meaning-checker` can downgrade an `UNRESOLVED` parser blocker only to `llm_resolved_unresolved_human_review`; it never auto-passes the card.
+- Rules/LLM agents should emit candidate issues with `span_source`, `span_ko` or explicit missing marker, and `semantic_diff`.
+- `verifier` checks whether a blocking candidate has enough evidence: source span + KO span/missing marker + semantic diff. Weak evidence becomes `issue_status=candidate`, `evidence_quality=weak`, `review_status=weak_evidence_human_review`.
 - LLM agents may add new grounded issues.
 - LLM agents may also return `issue_review[]` for existing deterministic issues.
 - A high-confidence LLM `false_positive_candidate` does **not** delete the deterministic issue.
 - Instead, the issue is annotated with `llm_disputed=true`, `review_status=llm_disputed_false_positive_candidate`, and an `llm_issue_review` evidence object.
-- If every blocking issue is LLM-disputed and no undisputed blocker remains, the final verdict becomes `Human review`, not `Pass`.
-- Human approval is still required before suppressing or promoting the false-positive lesson.
+- If every blocking issue is LLM-disputed, weak-evidence, or LLM-resolved-unresolved and no undisputed blocker remains, the final verdict becomes `Human review`, not `Pass`.
+- Human approval is still required before suppressing or promoting the false-positive/semantic-IR lesson.
 
 OpenAI-compatible setup:
 
