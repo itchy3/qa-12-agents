@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+qa/runs/
+data/runs/
+data/rulebook/*.pdf
+data/rulebook/index/*.sqlite
+data/rulebook/index/*.jsonl
