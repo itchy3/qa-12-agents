@@ -1,0 +1,1 @@
+{"card_id": "ITER_RUNNER_CARD", "issue_id": "ITER_RUNNER_CARD-REG_MODAL_MUST_TO_MAY", "human_feedback": "accepted", "action": "changed_translation", "before_span": "버릴 수 있습니다", "after_span": "버려야 합니다", "note": "must는 선택 가능이 아니라 의무라서 버려야 합니다가 맞음"}

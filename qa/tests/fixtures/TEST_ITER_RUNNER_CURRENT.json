@@ -1,0 +1,16 @@
+[
+  {
+    "card_id": "ITER_RUNNER_CARD",
+    "category": {
+      "component_type": "card",
+      "card_type": "effect_card",
+      "text_type": "effect_text"
+    },
+    "source_text": "Each adventurer must discard 1 item.",
+    "current_ko": "각 모험가는 아이템 1개를 버려야 합니다.",
+    "term_glossary": [],
+    "syntax_dictionary": [],
+    "prior_translations": [],
+    "approved_qa_logs": []
+  }
+]

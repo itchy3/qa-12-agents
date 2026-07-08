@@ -1,0 +1,2 @@
+{"card_id": "ITER_SCOPE_CARD", "issue_id": "ITER_SCOPE_CARD-REG_TARGET_SCOPE_BROADENED", "human_feedback": "accepted", "action": "changed_translation", "before_span": "각 모험가", "after_span": "그 모험가", "note": "that adventurer는 처치한 동일 행위자라서 각 모험가가 아니라 그 모험가가 맞음"}
+{"card_id": "ITER_SCOPE_CARD", "issue_id": "ITER_SCOPE_CARD-BATTLE_OBJECTIVE_POSITION_WARN", "human_feedback": "false_positive", "action": "kept_translation", "note": "프로젝트 포맷상 battleObjective 위치 차이는 scope가 명확하면 허용", "policy_candidate": "description_or_battleObjective_allowed_if_scope_clear"}
