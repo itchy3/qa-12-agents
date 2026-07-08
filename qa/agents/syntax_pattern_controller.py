@@ -154,6 +154,17 @@ def _is_broad_rule(row: dict) -> bool:
     return pattern in {'if', 'when', 'before x', 'after x', 'before', 'after'}
 
 
+def _syntax_difference(row: dict, actual_template: str, expected_template: str) -> dict:
+    semantic_role = str(row.get('semantic_role') or row.get('difference_type') or '').strip().lower()
+    actual_key = _template_key(actual_template)
+    expected_key = _template_key(expected_template)
+    if actual_key == expected_key:
+        return {'status': 'pass', 'difference_type': 'none', 'severity': 'Pass', 'meaning_equivalent': True}
+    if semantic_role in {'word_order_style', 'style_word_order', 'meaning_equivalent_word_order'}:
+        return {'status': 'warn', 'difference_type': 'style_word_order', 'severity': 'StyleWarning', 'meaning_equivalent': True}
+    return {'status': 'fail', 'difference_type': 'semantic_or_locked_template_mismatch', 'severity': 'Major', 'meaning_equivalent': False}
+
+
 def _locked_rule_checks(context: dict, source_pattern: str, actual_template: str) -> list[dict]:
     checks = []
     for row in _syntax_rules(context):
@@ -177,7 +188,8 @@ def _locked_rule_checks(context: dict, source_pattern: str, actual_template: str
                 'reason': 'Broad syntax trigger skipped because current KO template is not classified; avoid blind blocking on generic words such as if/when/before/after.',
             })
             continue
-        status = 'pass' if _template_key(actual_template) == _template_key(expected) else 'fail'
+        diff = _syntax_difference(row, actual_template, expected)
+        status = diff['status']
         checks.append({
             'check_type': 'locked_syntax_rule' if strength in {'locked', 'approved'} else 'syntax_rule',
             'rule_id': row.get('rule_id') or row.get('id') or re.sub(r'[^A-Z0-9]+', '_', str(row.get('source_pattern', '')).upper()).strip('_'),
@@ -186,8 +198,9 @@ def _locked_rule_checks(context: dict, source_pattern: str, actual_template: str
             'actual_ko_template': actual_template,
             'rule_strength': strength,
             'status': status,
-            'severity': 'Major' if status == 'fail' and strength in {'locked', 'approved'} else 'StyleWarning',
-            'meaning_equivalent': status == 'pass',
+            'severity': diff['severity'] if status != 'pass' else 'Pass',
+            'difference_type': diff['difference_type'],
+            'meaning_equivalent': diff['meaning_equivalent'],
             'rule_source': row.get('source') or 'syntax_dictionary',
         })
     return checks

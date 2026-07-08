@@ -70,6 +70,10 @@ LLM dispute policy:
 - The pipeline now emits a first-class `semantic_ir` artifact with `source_ir`, `ko_ir`, `status`, confidence, unknowns, and prior parser pattern.
 - `source-meaning-checker` can downgrade an `UNRESOLVED` parser blocker only to `llm_resolved_unresolved_human_review`; it never auto-passes the card.
 - Rules/LLM agents should emit candidate issues with `span_source`, `span_ko` or explicit missing marker, and `semantic_diff`.
+- `terminology-manager` classifies source hits by policy: `proper_noun_terms`, `ordinary_words_ignored`, `locked_terms`, and `unknown_rule_terms`. Proper nouns/lore terms can be checked strictly; broad/common words are not blind blockers.
+- `syntax-pattern-controller` separates semantic template mismatches from meaning-equivalent word-order/style variants. Style-only differences become `StyleWarning`/review signals, not Major blockers.
+- `cross-card-consistency-checker` records sample strength (`singleton`, `weak_observed`, `stable_observed`) and keeps small-sample dominant patterns as review candidates rather than blockers.
+- `rules-lawyer` compares semantic IR fields for modal, scope, target, timing, condition, exception, and number, then emits grounded candidate issues with `semantic_diff`.
 - `verifier` checks whether a blocking candidate has enough evidence: source span + KO span/missing marker + semantic diff. Weak evidence becomes `issue_status=candidate`, `evidence_quality=weak`, `review_status=weak_evidence_human_review`.
 - LLM agents may add new grounded issues.
 - LLM agents may also return `issue_review[]` for existing deterministic issues.

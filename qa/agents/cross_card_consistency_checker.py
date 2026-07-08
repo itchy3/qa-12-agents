@@ -127,7 +127,9 @@ def _syntax_structure_checks(context: dict, index: dict) -> list[dict]:
     entry = structures[pattern]
     current_template = _ko_syntax_template(context.get('current_ko', ''), pattern)
     dominant = entry.get('dominant_template')
-    confidence = entry.get('confidence') or 0
+    confidence = float(entry.get('confidence') or 0)
+    evidence_count = int(entry.get('total_count') or sum(len(v) for v in (entry.get('variants') or {}).values()))
+    evidence_strength = _evidence_strength(evidence_count, confidence)
     if confidence < 0.67:
         status = 'warn'
         status_reason = 'no_clear_dominant_template'
@@ -140,7 +142,11 @@ def _syntax_structure_checks(context: dict, index: dict) -> list[dict]:
         'current_template': current_template,
         'dominant_template': dominant,
         'variants': entry.get('variants', {}),
-        'confidence': entry.get('confidence'),
+        'confidence': confidence,
+        'evidence_count': evidence_count,
+        'evidence_strength': evidence_strength,
+        'candidate_type': 'review_candidate' if evidence_strength in {'singleton', 'weak_observed', 'no_clear_dominant'} else 'stable_observed_signal',
+        'blocks_approval': False,
         'status': status,
         'status_reason': status_reason,
         'severity': 'StyleWarning',

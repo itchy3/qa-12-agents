@@ -24,6 +24,62 @@ def _add_issue_once(issues: list[dict[str, Any]], issue: dict[str, Any]) -> None
     issues.append(issue)
 
 
+IR_COMPARISON_FIELDS = {
+    'modal': 'Modal force mismatch',
+    'scope': 'Scope mismatch',
+    'target': 'Target scope mismatch',
+    'timing': 'Timing mismatch',
+    'condition': 'Condition mismatch',
+    'exception': 'Exception mismatch',
+    'number': 'Number mismatch',
+}
+
+
+def _ir_value(ir: dict[str, Any], field: str):
+    value = ir.get(field)
+    if value is None and field == 'number':
+        value = ir.get('count') or ir.get('amount')
+    if isinstance(value, list):
+        return ', '.join(str(v) for v in value)
+    if isinstance(value, dict):
+        return ', '.join(f'{k}={v}' for k, v in sorted(value.items()))
+    return value
+
+
+def _has_meaningful_ir_value(value: Any) -> bool:
+    return value is not None and str(value).strip() != '' and str(value).strip().lower() not in {'unknown', 'same', 'unchanged'}
+
+
+def _detect_semantic_ir_risks(context: dict[str, Any], issues: list[dict[str, Any]]) -> None:
+    semantic_ir = context.get('semantic_ir') or {}
+    source_ir = semantic_ir.get('source_ir') or {}
+    ko_ir = semantic_ir.get('ko_ir') or {}
+    if not isinstance(source_ir, dict) or not isinstance(ko_ir, dict):
+        return
+    code = context.get('code', 'CARD')
+    for field, issue_type in IR_COMPARISON_FIELDS.items():
+        source_value = _ir_value(source_ir, field)
+        ko_value = _ir_value(ko_ir, field)
+        if not _has_meaningful_ir_value(source_value) or not _has_meaningful_ir_value(ko_value):
+            continue
+        if str(source_value).strip().lower() == str(ko_value).strip().lower():
+            continue
+        issue_code = re.sub(r'[^A-Z0-9]+', '_', field.upper()).strip('_')
+        _add_issue_once(issues, {
+            'issue_id': f'{code}-IR_{issue_code}_MISMATCH',
+            'issue_type': issue_type,
+            'severity': 'Major',
+            'span_source': str(source_value),
+            'span_ko': '' if str(ko_value).strip().lower() == 'missing' else str(ko_value),
+            'semantic_diff': {'field': field, 'source_value': source_value, 'ko_value': ko_value},
+            'evidence': f'Semantic IR comparison: source {field}=`{source_value}` but KO {field}=`{ko_value}`.',
+            'suggested_fix': f'Preserve source {field}: {source_value}.',
+            'confidence': min(float(semantic_ir.get('confidence') or 0.88), 0.95),
+            'blocks_approval': True,
+            'comparison_source': 'semantic_ir',
+        })
+
+
 def _scope_checks_from_issues(issues: list[dict]) -> list[dict]:
     checks = []
     for issue in issues:
@@ -65,6 +121,18 @@ def _scope_checks_from_issues(issues: list[dict]) -> list[dict]:
                 'decision': 'target_scope_broadened_blocks_approval',
                 'suggested_fix': issue.get('suggested_fix', ''),
             })
+        diff = issue.get('semantic_diff') or {}
+        if diff.get('field') in {'scope', 'target', 'timing', 'condition', 'exception'}:
+            checks.append({
+                'case_id': issue_id,
+                'scope_check_type': f"ir_{diff.get('field')}_preservation",
+                'source_phrase': issue.get('span_source', ''),
+                'ko_span': issue.get('span_ko', ''),
+                'semantic_diff': diff,
+                'scope_preserved': False,
+                'decision': 'semantic_ir_mismatch_blocks_approval',
+                'suggested_fix': issue.get('suggested_fix', ''),
+            })
     return checks
 
 
@@ -78,6 +146,17 @@ def _modal_checks_from_issues(issues: list[dict]) -> list[dict]:
                 'ko_modal': issue.get('span_ko', ''),
                 'force_preserved': False,
                 'decision': 'obligation_weakened_to_optional_blocks_approval',
+                'suggested_fix': issue.get('suggested_fix', ''),
+            })
+        diff = issue.get('semantic_diff') or {}
+        if diff.get('field') in {'modal', 'number'}:
+            checks.append({
+                'case_id': issue.get('issue_id', ''),
+                'check_type': f"ir_{diff.get('field')}_preservation",
+                'source_value': diff.get('source_value'),
+                'ko_value': diff.get('ko_value'),
+                'preserved': False,
+                'decision': 'semantic_ir_mismatch_blocks_approval',
                 'suggested_fix': issue.get('suggested_fix', ''),
             })
     return checks
@@ -195,6 +274,7 @@ def run(context):
     _detect_modal_force_risks(context, issues)
     _detect_target_scope_risks(context, issues)
     _detect_scope_qualifier_risks(context, issues)
+    _detect_semantic_ir_risks(context, issues)
     llm_data = _llm_rules_lawyer(context)
     llm_dispute_reviews: list[dict[str, Any]] = []
     if llm_data:

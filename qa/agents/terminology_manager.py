@@ -242,19 +242,55 @@ def _unknown_rule_term_proposals(context: dict, source_terms: set[str], approved
     return proposals
 
 
+def _row_term_class(row: dict) -> str:
+    category = str(row.get('category') or row.get('term_category') or '').strip().lower()
+    policy = str(row.get('lock_policy') or row.get('term_policy') or '').strip().lower()
+    if category in {'proper_noun', 'lore_term', 'named_entity', 'entity'}:
+        return 'proper_noun_or_lore'
+    if category in {'common_word', 'ordinary_word', 'general_word', 'broad'} or policy in {'broad', 'contextual'}:
+        return 'ordinary_word'
+    if category in {'rules_term', 'mechanic', 'mechanics', 'keyword'} or policy in {'blocking', 'locked', 'required', 'strict'}:
+        return 'rules_term'
+    return 'multi_word_term' if len(str(row.get('en') or '').split()) >= 2 else 'ordinary_word'
+
+
+def _term_class(term: str, rows: list[dict] | None) -> str:
+    if not rows:
+        return 'unknown_rule_term' if term.split()[-1] in UNKNOWN_REVIEW_NOUNS else 'unknown'
+    classes = {_row_term_class(row) for row in rows}
+    if 'proper_noun_or_lore' in classes:
+        return 'proper_noun_or_lore'
+    if 'rules_term' in classes:
+        return 'rules_term'
+    if 'multi_word_term' in classes:
+        return 'multi_word_term'
+    return 'ordinary_word'
+
+
 def _source_terms_by_policy(source_terms: set[str], approved_terms: dict[str, list[dict]]) -> dict[str, list[str]]:
     locked_terms = []
     broad_terms_ignored = []
     unknown_rule_terms = []
+    proper_noun_terms = []
+    ordinary_words_ignored = []
     for term in sorted(source_terms):
-        if term in approved_terms and _is_locked_term(term, approved_terms.get(term)):
+        cls = _term_class(term, approved_terms.get(term))
+        if cls == 'proper_noun_or_lore':
+            proper_noun_terms.append(term)
             locked_terms.append(term)
+        elif term in approved_terms and _is_locked_term(term, approved_terms.get(term)):
+            locked_terms.append(term)
+        elif cls == 'ordinary_word':
+            ordinary_words_ignored.append(term)
+            broad_terms_ignored.append(term)
         elif term in approved_terms:
             broad_terms_ignored.append(term)
         else:
             unknown_rule_terms.append(term)
     return {
         'locked_terms': locked_terms,
+        'proper_noun_terms': proper_noun_terms,
+        'ordinary_words_ignored': ordinary_words_ignored,
         'broad_terms_ignored': broad_terms_ignored,
         'unknown_rule_terms': unknown_rule_terms,
     }
@@ -313,6 +349,7 @@ def run(context):
         'glossary_review_proposals': glossary_review_proposals,
         'source_terms_checked': sorted(source_terms),
         'source_terms_by_policy': by_policy,
+        'term_classification': {term: _term_class(term, approved_terms.get(term)) for term in sorted(source_terms)},
         'terminology_quality': quality,
     }
     return record_agent(context, AGENT_NAME, {'summary': f'terminology {status}; locked={quality["locked_terms_checked"]}; review={quality["unknown_review_terms"]}'})
