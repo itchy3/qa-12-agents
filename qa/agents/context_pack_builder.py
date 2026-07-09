@@ -53,7 +53,13 @@ def _compact_glossary_hit(hit: dict) -> dict:
         compact['row'] = hit.get('sheet_row')
     elif hit.get('row') is not None:
         compact['row'] = hit.get('row')
-    for source_key, out_key in [('en', 'en'), ('ko', 'ko'), ('status', 'status'), ('notes', 'notes')]:
+    for source_key, out_key in [
+        ('en', 'en'), ('ko', 'ko'), ('status', 'status'), ('notes', 'notes'),
+        ('category', 'category'), ('term_category', 'term_category'),
+        ('lock_policy', 'lock_policy'), ('term_policy', 'term_policy'),
+        ('forbidden_ko', 'forbidden_ko'), ('deprecated_ko', 'deprecated_ko'),
+        ('source', 'source'), ('source_refs', 'source_refs'),
+    ]:
         value = hit.get(source_key)
         if value not in [None, '']:
             compact[out_key] = value
@@ -76,6 +82,71 @@ def _glossary_summary(hits: list[dict]) -> dict:
             counts['broad_common'] += 1
     counts['total'] = len(hits)
     return counts
+
+
+def _is_lore_glossary_row(row: dict) -> bool:
+    category = str(row.get('category') or row.get('term_category') or '').strip().lower()
+    policy = str(row.get('lock_policy') or row.get('term_policy') or '').strip().lower()
+    return category in {'lore_term', 'proper_noun', 'named_entity', 'entity'} or policy in {'lore', 'ontology'}
+
+
+def _glossary_lore_ontology_hits(term_hits: list[dict]) -> list[dict]:
+    hits = []
+    for idx, row in enumerate(term_hits, start=1):
+        if not isinstance(row, dict) or not _is_lore_glossary_row(row):
+            continue
+        en = row.get('en') or row.get('term') or row.get('source') or row.get('english')
+        ko = row.get('ko') or row.get('target') or row.get('korean')
+        if not en or not ko:
+            continue
+        hit = {
+            'id': row.get('id') or f'context_glossary:{str(en).strip().casefold()}',
+            'entity_id': row.get('entity_id') or row.get('id') or f'context_glossary:{str(en).strip().casefold()}',
+            'type': row.get('entity_type') or row.get('type') or row.get('category') or 'lore_term',
+            'canonical_en': str(en).strip(),
+            'term': str(en).strip(),
+            'aliases_en': row.get('aliases_en') or row.get('english_aliases') or [],
+            'canonical_ko': str(ko).strip(),
+            'ko': str(ko).strip(),
+            'aliases_ko': row.get('aliases_ko') or row.get('allowed_variants_ko') or [str(ko).strip()],
+            'allowed_variants_ko': row.get('allowed_variants_ko') or row.get('aliases_ko') or [str(ko).strip()],
+            'forbidden_ko': row.get('forbidden_ko') or row.get('deprecated_ko') or [],
+            'status': row.get('status') or 'approved',
+            'ko_status': row.get('status') or 'approved',
+            'source': row.get('source') or 'input_card.term_glossary',
+            'source_refs': row.get('source_refs') or [row.get('source') or 'input_card.term_glossary'],
+            'confidence': 0.95 if str(row.get('status') or '').lower() == 'approved' else 0.75,
+            'strategy': 'context_glossary_lore_term',
+        }
+        hits.append(hit)
+    return hits
+
+
+def _merge_ontology_hits(primary: list, supplemental: list[dict]) -> list:
+    merged = []
+    seen = set()
+    for hit in list(primary or []) + list(supplemental or []):
+        if not isinstance(hit, dict):
+            merged.append(hit)
+            continue
+        key = str(hit.get('canonical_en') or hit.get('term') or hit.get('en') or hit.get('entity_id') or '').casefold()
+        if key and key in seen:
+            # Prefer an earlier real ontology row, but if it lacks Korean evidence
+            # and supplemental glossary has it, enrich the existing compact hit.
+            if supplemental and hit in supplemental:
+                for existing in merged:
+                    existing_key = str(existing.get('canonical_en') or existing.get('term') or existing.get('en') or existing.get('entity_id') or '').casefold() if isinstance(existing, dict) else ''
+                    if existing_key == key:
+                        for field in ['canonical_ko', 'ko', 'aliases_ko', 'allowed_variants_ko', 'forbidden_ko', 'ko_status']:
+                            if not existing.get(field) and hit.get(field):
+                                existing[field] = hit[field]
+                        existing.setdefault('supplemental_sources', []).append(hit.get('source'))
+                        break
+            continue
+        if key:
+            seen.add(key)
+        merged.append(hit)
+    return merged
 
 
 def _section_ref(sections: dict[str, list[str]], key: str, occurrence: int) -> dict | None:
@@ -166,10 +237,17 @@ def run(context):
         similar = _explicit_or_fallback(input_card, 'prior_translations', similar)
         qa_logs = _explicit_or_fallback(input_card, 'approved_qa_logs', qa_logs)
     ontology_lookup_quality = {'source': 'explicit_input', 'ontology_available': None, 'warnings': []}
-    if input_card and 'lore_ontology' in input_card:
-        ontology_hits = input_card.get('lore_ontology', [])
+    glossary_ontology_hits = _glossary_lore_ontology_hits(term_hits if isinstance(term_hits, list) else [])
+    if input_card and 'lore_ontology' in input_card and input_card.get('lore_ontology'):
+        ontology_hits = _merge_ontology_hits(input_card.get('lore_ontology', []), glossary_ontology_hits)
+    elif input_card and 'lore_ontology' in input_card:
+        ontology_hits = glossary_ontology_hits
     else:
         ontology_hits, ontology_lookup_quality = lookup_ontology_hits(context['source_text'])
+        ontology_hits = _merge_ontology_hits(ontology_hits, glossary_ontology_hits)
+    if glossary_ontology_hits:
+        ontology_lookup_quality = dict(ontology_lookup_quality)
+        ontology_lookup_quality['context_glossary_lore_hits'] = len(glossary_ontology_hits)
     patch_hits = input_card.get('patch_notes', [])
     source_sections = parse_sections(context['source_text'])
     translation_sections = parse_sections(context['current_ko'])

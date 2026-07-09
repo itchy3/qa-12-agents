@@ -7,9 +7,9 @@ import re
 from pathlib import Path
 from typing import Any
 
-PROJECT = Path(__file__).resolve().parents[2]
-QA_ROOT = PROJECT / 'qa'
-RUNS_ROOT = PROJECT / 'qa' / 'runs'
+QA_ROOT = Path(__file__).resolve().parents[1]
+PROJECT = QA_ROOT.parent
+RUNS_ROOT = QA_ROOT / 'runs'
 
 BLOCKING_SEVERITIES = {'Critical', 'Major'}
 

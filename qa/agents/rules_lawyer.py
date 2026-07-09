@@ -17,11 +17,179 @@ def _has_obligation_ko(text: str) -> bool:
     return bool(re.search(r'해야|하여야|반드시|버려야|얻어야|배치해야|잃어야|선택해야|굴려야', text or ''))
 
 
+def _evidence_score(issue: dict[str, Any]) -> int:
+    score = 0
+    if issue.get('span_source') or issue.get('source_span'):
+        score += 1
+    if issue.get('span_ko') or issue.get('ko_span'):
+        score += 1
+    if issue.get('semantic_diff'):
+        score += 2
+    if issue.get('evidence_quality') == 'sufficient':
+        score += 1
+    return score
+
+
+def _merge_issue_evidence(existing: dict[str, Any], incoming: dict[str, Any]) -> None:
+    """Merge duplicate issue IDs without letting weak LLM/raw issues erase evidence."""
+    for key, value in incoming.items():
+        if value in [None, '', [], {}]:
+            continue
+        if key in {'span_source', 'span_ko', 'source_span', 'ko_span'}:
+            old = str(existing.get(key) or '')
+            new = str(value)
+            generic_markers = {'must', '수 있습니다', '할 수 있습니다/가능', '가능', 'xp', 'number'}
+            if old.lower() in generic_markers or (len(new) > len(old) + 8 and old in new):
+                existing[key] = value
+                continue
+        if key not in existing or existing.get(key) in [None, '', [], {}]:
+            existing[key] = value
+            continue
+        if key == 'semantic_diff' and isinstance(existing.get(key), dict) and isinstance(value, dict):
+            merged = dict(existing[key])
+            for diff_key, diff_value in value.items():
+                if diff_value not in [None, '', [], {}] and merged.get(diff_key) in [None, '', [], {}]:
+                    merged[diff_key] = diff_value
+            existing[key] = merged
+    if _evidence_score(incoming) > _evidence_score(existing):
+        for key in ['span_source', 'span_ko', 'source_span', 'ko_span', 'semantic_diff', 'evidence', 'suggested_fix']:
+            if incoming.get(key) not in [None, '', [], {}]:
+                existing[key] = incoming[key]
+
+
 def _add_issue_once(issues: list[dict[str, Any]], issue: dict[str, Any]) -> None:
     issue_id = issue.get('issue_id')
-    if not issue_id or any(existing.get('issue_id') == issue_id for existing in issues):
+    if not issue_id:
         return
+    for existing in issues:
+        if existing.get('issue_id') == issue_id:
+            _merge_issue_evidence(existing, issue)
+            return
     issues.append(issue)
+
+
+def _sentences(text: str) -> list[str]:
+    parts: list[str] = []
+    for line in re.split(r'\n+', text or ''):
+        line = re.sub(r'\s+', ' ', line).strip()
+        if not line:
+            continue
+        parts.extend(p.strip() for p in re.split(r'(?<=[.!?。！？])\s+', line) if p.strip())
+    return parts
+
+
+def _first_sentence_matching(text: str, pattern: str) -> str:
+    rx = re.compile(pattern, re.I)
+    for sentence in _sentences(text):
+        if rx.search(sentence):
+            return sentence
+    m = rx.search(text or '')
+    return m.group(0) if m else ''
+
+
+def _first_optional_ko_sentence(text: str) -> str:
+    return _first_sentence_matching(text, r'수\s*있|가능|해도\s*됩니다|할\s*수')
+
+
+def _first_obligation_source_sentence(text: str) -> str:
+    return _first_sentence_matching(text, r'\bmust\b|\bcannot\b|required|required to|mandatory')
+
+
+def _xp_mentions(text: str) -> list[dict[str, Any]]:
+    mentions: list[dict[str, Any]] = []
+    for sentence in _sentences(text):
+        for m in re.finditer(r'(?i)(\d+)\s*(?:bonus\s*)?XP|(?:XP|경험치)\s*(\d+)|(\d+)\s*경험치', sentence):
+            amount = next((g for g in m.groups() if g), None)
+            if not amount:
+                continue
+            mentions.append({'amount': int(amount), 'span': m.group(0), 'sentence': sentence})
+    return mentions
+
+
+def _best_xp_mismatch(source: str, ko: str) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    source_mentions = _xp_mentions(source)
+    ko_mentions = _xp_mentions(ko)
+    if not source_mentions or not ko_mentions:
+        return None
+    reward_words = re.compile(r'(?i)reward|gain|XP|보상|얻|획득')
+    source_ranked = sorted(source_mentions, key=lambda x: (not bool(reward_words.search(x['sentence'])), x['amount']))
+    ko_ranked = sorted(ko_mentions, key=lambda x: (not bool(reward_words.search(x['sentence'])), x['amount']))
+    for src in source_ranked:
+        for target in ko_ranked:
+            if src['amount'] != target['amount']:
+                return src, target
+    return None
+
+
+def _is_modal_issue(issue: dict[str, Any]) -> bool:
+    issue_tail = str(issue.get('issue_id', '')).split('-', 1)[-1]
+    text = ' '.join([issue_tail] + [str(issue.get(k, '')) for k in ['issue_type', 'evidence']]).lower()
+    return 'modal' in text or 'must_to_may' in text or 'obligation' in text
+
+
+def _is_quantity_issue(issue: dict[str, Any]) -> bool:
+    issue_tail = str(issue.get('issue_id', '')).split('-', 1)[-1]
+    text = ' '.join([issue_tail] + [str(issue.get(k, '')) for k in ['issue_type', 'evidence']]).lower()
+    if any(axis in text for axis in ['timing', 'scope', 'target', 'condition', 'exception']) and not any(token in text for token in ['reward', 'xp', 'quantity']):
+        return False
+    return any(token in text for token in ['quantity', 'reward', 'xp']) or ('number' in text and not any(axis in text for axis in ['timing', 'scope', 'target', 'condition', 'exception']))
+
+
+def _normalize_issue_evidence(context: dict[str, Any], issue: dict[str, Any]) -> None:
+    source = context.get('source_text', '')
+    ko = context.get('current_ko', '')
+    if _is_modal_issue(issue) and re.search(r'\bmust\b|\bcannot\b|required|required to|mandatory', source, re.I) and _has_optional_ko(ko):
+        source_span = _first_obligation_source_sentence(source) or issue.get('span_source') or 'must'
+        ko_span = _first_optional_ko_sentence(ko) or issue.get('span_ko') or '할 수 있습니다/가능'
+        enriched = {
+            'span_source': source_span,
+            'span_ko': ko_span,
+            'semantic_diff': {
+                'field': 'modal_force',
+                'source_value': 'mandatory',
+                'ko_value': 'optional',
+                'source_marker': 'must/cannot/required',
+                'ko_marker': '할 수 있습니다/가능',
+            },
+            'evidence': 'Grounded modal-force comparison: source expresses a mandatory obligation, while KO expresses optional possibility.',
+            'suggested_fix': issue.get('suggested_fix') or '의무/강제성은 “해야 합니다/반드시 …합니다” 계열로 보존합니다.',
+            'blocks_approval': True,
+        }
+        _merge_issue_evidence(issue, enriched)
+        issue['span_source'] = enriched['span_source']
+        issue['span_ko'] = enriched['span_ko']
+        issue['semantic_diff'] = enriched['semantic_diff']
+    if _is_quantity_issue(issue):
+        current_field = ((issue.get('semantic_diff') or {}).get('field') or '').strip()
+        if current_field and current_field not in {'number', 'quantity', 'reward.quantity'}:
+            return
+        mismatch = _best_xp_mismatch(source, ko)
+        if mismatch:
+            src, target = mismatch
+            enriched = {
+                'span_source': src['sentence'] or src['span'],
+                'span_ko': target['sentence'] or target['span'],
+                'semantic_diff': {
+                    'field': 'reward.quantity',
+                    'unit': 'XP',
+                    'source_value': f"{src['amount']} XP",
+                    'ko_value': f"{target['amount']} XP",
+                    'source_amount': src['amount'],
+                    'ko_amount': target['amount'],
+                },
+                'evidence': 'Grounded reward/quantity comparison: source and KO contain different XP reward amounts in reward-like context.',
+                'suggested_fix': issue.get('suggested_fix') or f"XP 보상 수량을 원문 {src['amount']} XP에 맞춥니다.",
+                'blocks_approval': True,
+            }
+            _merge_issue_evidence(issue, enriched)
+            issue['span_source'] = enriched['span_source']
+            issue['span_ko'] = enriched['span_ko']
+            issue['semantic_diff'] = enriched['semantic_diff']
+
+
+def _normalize_all_issue_evidence(context: dict[str, Any], issues: list[dict[str, Any]]) -> None:
+    for issue in issues:
+        _normalize_issue_evidence(context, issue)
 
 
 IR_COMPARISON_FIELDS = {
@@ -50,6 +218,46 @@ def _has_meaningful_ir_value(value: Any) -> bool:
     return value is not None and str(value).strip() != '' and str(value).strip().lower() not in {'unknown', 'same', 'unchanged'}
 
 
+def _norm_ir_text(value: Any) -> str:
+    return re.sub(r'\s+', ' ', str(value or '').strip().lower())
+
+
+IR_EQUIVALENTS = {
+    'target': {
+        ('an enemy', '적 하나'),
+        ('one enemy', '적 하나'),
+        ('an adventurer', '모험가 하나'),
+        ('one adventurer', '모험가 하나'),
+    },
+    'number': {
+        ('one time', '한 번'),
+        ('once', '한 번'),
+        ('two times', '두 번'),
+        ('twice', '두 번'),
+        ('three times', '세 번'),
+        ('3 times', '3번'),
+        ('3 times', '세 번'),
+        ('three times', '3번'),
+    },
+}
+
+
+def _ir_values_equivalent(field: str, source_value: Any, ko_value: Any) -> bool:
+    source_norm = _norm_ir_text(source_value)
+    ko_norm = _norm_ir_text(ko_value)
+    if source_norm == ko_norm:
+        return True
+    pairs = IR_EQUIVALENTS.get(field, set())
+    if (source_norm, ko_norm) in pairs:
+        return True
+    if field == 'number':
+        source_number = re.search(r'\b(\d+)\b', source_norm)
+        ko_number = re.search(r'(\d+)\s*번', ko_norm)
+        if source_number and ko_number and source_number.group(1) == ko_number.group(1):
+            return True
+    return False
+
+
 def _detect_semantic_ir_risks(context: dict[str, Any], issues: list[dict[str, Any]]) -> None:
     semantic_ir = context.get('semantic_ir') or {}
     source_ir = semantic_ir.get('source_ir') or {}
@@ -62,7 +270,7 @@ def _detect_semantic_ir_risks(context: dict[str, Any], issues: list[dict[str, An
         ko_value = _ir_value(ko_ir, field)
         if not _has_meaningful_ir_value(source_value) or not _has_meaningful_ir_value(ko_value):
             continue
-        if str(source_value).strip().lower() == str(ko_value).strip().lower():
+        if _ir_values_equivalent(field, source_value, ko_value):
             continue
         issue_code = re.sub(r'[^A-Z0-9]+', '_', field.upper()).strip('_')
         _add_issue_once(issues, {
@@ -120,6 +328,17 @@ def _scope_checks_from_issues(issues: list[dict]) -> list[dict]:
                 'scope_preserved': False,
                 'decision': 'target_scope_broadened_blocks_approval',
                 'suggested_fix': issue.get('suggested_fix', ''),
+            })
+        if issue.get('issue_type') == 'Verified scope' or issue_id.endswith('SCOPE-OK'):
+            checks.append({
+                'case_id': issue.get('case_id') or 'REG_SCOPE_PARALLEL_TARGETS_001',
+                'scope_check_type': issue.get('scope_check_type') or 'target_scope_preservation',
+                'source_phrase': issue.get('span_source', ''),
+                'ko_span': issue.get('span_ko', ''),
+                'scope_preserved': True,
+                'decision': issue.get('decision') or 'current_translation_scope_correct',
+                'broadened_scope_suggestion_blocked': issue.get('broadened_scope_suggestion_blocked', True),
+                'evidence': issue.get('evidence'),
             })
         diff = issue.get('semantic_diff') or {}
         if diff.get('field') in {'scope', 'target', 'timing', 'condition', 'exception'}:
@@ -228,6 +447,68 @@ def _detect_scope_qualifier_risks(context: dict[str, Any], issues: list[dict[str
         })
 
 
+def _detect_quantity_risks(context: dict[str, Any], issues: list[dict[str, Any]]) -> None:
+    source = context.get('source_text', '')
+    ko = context.get('current_ko', '')
+    code = context.get('code', 'CARD')
+    mismatch = _best_xp_mismatch(source, ko)
+    if not mismatch:
+        return
+    src, target = mismatch
+    _add_issue_once(issues, {
+        'issue_id': f'{code}-REG_REWARD_QUANTITY_MISMATCH',
+        'issue_type': 'Reward/quantity mismatch',
+        'severity': 'Major',
+        'span_source': src['sentence'] or src['span'],
+        'span_ko': target['sentence'] or target['span'],
+        'semantic_diff': {
+            'field': 'reward.quantity',
+            'unit': 'XP',
+            'source_value': f"{src['amount']} XP",
+            'ko_value': f"{target['amount']} XP",
+            'source_amount': src['amount'],
+            'ko_amount': target['amount'],
+        },
+        'evidence': 'Rules-lawyer quantity grounder: source and KO contain different XP reward amounts in reward-like context.',
+        'suggested_fix': f"XP 보상 수량을 원문 {src['amount']} XP에 맞춥니다.",
+        'confidence': 0.9,
+        'blocks_approval': True,
+    })
+
+
+def _detect_narrative_concept_polarity_risks(context: dict[str, Any], issues: list[dict[str, Any]]) -> None:
+    source = context.get('source_text', '')
+    ko = context.get('current_ko', '')
+    code = context.get('code', 'CARD')
+    lower = source.lower()
+    # Narrative/concept descriptions can carry rules-critical identity. The BM-06
+    # adversarial case changed "new breed/species" to "old species" outside the
+    # mechanical rules block, so catch polarity pairs in description text too.
+    if not re.search(r'\bnew\s+(?:breed|species)\b|\bnew\s+breed\s+of\s+animal\b', lower):
+        return
+    ko_old = _first_sentence_matching(ko, r'오래된\s*(?:종|품종)')
+    if not ko_old:
+        return
+    source_span = _first_sentence_matching(source, r'\bnew\s+(?:breed|species)\b|\bnew\s+breed\s+of\s+animal\b')
+    _add_issue_once(issues, {
+        'issue_id': f'{code}-REG_NARRATIVE_CONCEPT_POLARITY_NEW_TO_OLD',
+        'issue_type': 'Narrative concept polarity mismatch',
+        'severity': 'Major',
+        'span_source': source_span or 'new breed/species',
+        'span_ko': ko_old,
+        'semantic_diff': {
+            'field': 'narrative.concept_polarity',
+            'concept': 'species/breed novelty',
+            'source_value': 'new',
+            'ko_value': 'old',
+        },
+        'evidence': 'Grounded narrative concept comparison: source describes a new breed/species, while KO describes an old species/breed.',
+        'suggested_fix': '“새로운 종/새로운 품종”처럼 원문의 new concept polarity를 보존합니다.',
+        'confidence': 0.92,
+        'blocks_approval': True,
+    })
+
+
 def _apply_llm_issue_review(issues: list[dict[str, Any]], issue_reviews: list[dict[str, Any]]) -> list[dict[str, Any]]:
     applied: list[dict[str, Any]] = []
     by_id = {issue.get('issue_id'): issue for issue in issues}
@@ -274,12 +555,16 @@ def run(context):
     _detect_modal_force_risks(context, issues)
     _detect_target_scope_risks(context, issues)
     _detect_scope_qualifier_risks(context, issues)
+    _detect_quantity_risks(context, issues)
+    _detect_narrative_concept_polarity_risks(context, issues)
     _detect_semantic_ir_risks(context, issues)
+    _normalize_all_issue_evidence(context, issues)
     llm_data = _llm_rules_lawyer(context)
     llm_dispute_reviews: list[dict[str, Any]] = []
     if llm_data:
         for issue in llm_data.get('issues') or []:
             _add_issue_once(issues, issue)
+        _normalize_all_issue_evidence(context, issues)
         llm_dispute_reviews = _apply_llm_issue_review(issues, llm_data.get('issue_review') or [])
     context['facts']['issues'] = issues
 

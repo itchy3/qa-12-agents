@@ -16,7 +16,7 @@ if str(QA_ROOT) not in sys.path:
 
 from agents.shared import AGENT_SEQUENCE, PIPELINE_NAMES, QA_ROOT as SHARED_QA_ROOT, new_context, new_context_from_card, now_iso, pipeline_steps, build_step_quality
 
-MODULES = ['context_pack_builder','source_meaning_checker','terminology_manager','syntax_pattern_controller','inductive_style_learner','cross_card_consistency_checker','lore_ontology_checker','patch_note_checker','rules_lawyer','korean_editor','verifier','qa_reviewer']
+MODULES = ['context_pack_builder','source_meaning_checker','terminology_manager','terminology_pattern_worker','syntax_pattern_controller','syntax_style_worker','inductive_style_learner','cross_card_consistency_checker','cross_card_pattern_worker','lore_ontology_checker','lore_ontology_worker','patch_note_checker','rules_lawyer','korean_editor','verifier','qa_reviewer','harness_meta_auditor']
 
 STYLE_PATTERNS = {
     'Persistent:': ['지속:'],
@@ -134,6 +134,8 @@ def _source_syntax_pattern(source: str) -> str:
         return 'Attack an enemy N times'
     if re.search(r'recover \d+ health \d+ times', lower):
         return 'Recover N health M times'
+    if re.search(r'\b(?:gain|gains|lose|loses)\s+\d+\s+[a-z][a-z -]*\b', lower):
+        return 'Gain/Lose N TERM'
     if re.search(r'use\s+(?:the|this|that|an?|your)?\s*[a-z][a-z\s-]*?\s+\d+\s+times?', lower):
         return 'VERB OBJECT N times'
     return ''
@@ -168,6 +170,11 @@ def _ko_syntax_template(ko: str, source_pattern: str) -> str:
             return 'OBJ_COUNT_VERB'
         if re.search(r'\d+번 체력 \d+을 회복', text):
             return 'COUNT_OBJ_VERB'
+    if source_pattern == 'Gain/Lose N TERM':
+        if re.search(r'\d+\s*(?:\[\[[^]|]+\|)?(?![을를이가은는]\s)[가-힣A-Za-z_]{2,}(?:\]\])?(?:을|를)?\s*(?:얻|잃)', text):
+            return 'NUM_TERM_VERB'
+        if re.search(r'(?:\[\[[^]|]+\|)?(?![을를이가은는]\s)[가-힣A-Za-z_]{2,}(?:\]\])?\s*\d+(?:을|를)?\s*(?:얻|잃)', text):
+            return 'TERM_NUM_VERB'
     if source_pattern == 'VERB OBJECT N times':
         if re.search(r'[가-힣A-Za-z0-9_\s]+(?:을|를)\s*\d+번\s*(?:반복해\s*)?사용', text):
             return 'OBJ_COUNT_VERB'
@@ -313,6 +320,131 @@ def _write_corpus_preflight_report(path: Path, syntax_index: dict, dominant: dic
     path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
 
 
+def _norm_source_term(term: str) -> str:
+    term = re.sub(r'\bavailable\b', ' ', (term or '').lower())
+    term = re.sub(r'\b(skill) die\b', r'\1 dice', term)
+    term = re.sub(r'\bdie\b', 'dice', term)
+    term = re.sub(r'[^a-z0-9 ]+', ' ', term)
+    return re.sub(r'\s+', ' ', term).strip()
+
+
+def _quantity_source_observations(source: str) -> list[dict]:
+    text = ' '.join((source or '').split())
+    observations = []
+    for m in re.finditer(r'\b(?:gain|gains|lose|loses)\s+(?P<num>\d+)\s+(?P<term>[A-Za-z][A-Za-z -]*?)(?=\.|,|;| and | or |$)', text, re.I):
+        term = _norm_source_term(m.group('term'))
+        if term:
+            observations.append({'source_family': 'GAIN_LOSE_NUM_TERM', 'term_source': term, 'index_key': f'GAIN_LOSE_NUM_TERM::{term}'})
+    for m in re.finditer(r'\bexhaust\s+(?:(?P<num>\d+)\s+)?(?P<term>(?:available\s+)?[A-Za-z][A-Za-z -]*?(?:die|dice))\b', text, re.I):
+        term = _norm_source_term(m.group('term'))
+        if term:
+            observations.append({'source_family': 'EXHAUST_NUM_TERM', 'term_source': term, 'index_key': f'EXHAUST_NUM_TERM::{term}'})
+    # De-duplicate while preserving order.
+    seen = set()
+    out = []
+    for obs in observations:
+        if obs['index_key'] in seen:
+            continue
+        seen.add(obs['index_key'])
+        out.append(obs)
+    return out
+
+
+def _clean_ko_term(term: str) -> str:
+    term = re.sub(r'\[\[[^]|]+\|([^]]+)\]\]', r'\1', term or '')
+    term = re.sub(r'\[\[([^]]+)\]\]', r'\1', term)
+    term = re.sub(r'\b(?:사용 가능한|각|모든|아무|해당)\b', ' ', term)
+    term = re.sub(r'\s+', ' ', term).strip(' .,:;')
+    term = re.sub(r'(?:을|를|이|가|은|는)$', '', term)
+    if '스킬 주사위' in term:
+        m = re.search(r'((?:전투|궁술|중갑|그림자|곡예술|데이드라 소환술)\s+스킬 주사위)$', term)
+        term = m.group(1).strip() if m else '스킬 주사위'
+    elif '주사위' in term:
+        m = re.search(r'((?:[가-힣A-Za-z_]+\s+){0,1}[가-힣A-Za-z_]*주사위)$', term)
+        if m:
+            term = m.group(1).strip()
+    return term
+
+
+def _quantity_ko_candidates(ko: str) -> list[dict]:
+    text = ' '.join((ko or '').split())
+    candidates = []
+    # 5 끈기를 얻습니다 / 2 명성을 잃습니다
+    for m in re.finditer(r'(?P<num>\d+)\s*(?P<term>(?:\[\[[^]|]+\|)?(?![을를이가은는]\s)[가-힣A-Za-z_]{2,}(?:\]\])?)(?:을|를)?\s*(?P<verb>얻|잃)', text):
+        candidates.append({'template': 'NUM_TERM_VERB', 'term_ko': _clean_ko_term(m.group('term')), 'span_ko': m.group(0)})
+    # 끈기 5를 얻습니다 / 명성 2를 잃습니다
+    for m in re.finditer(r'(?P<term>(?:\[\[[^]|]+\|)?(?![을를이가은는]\s)[가-힣A-Za-z_]{2,}(?:\]\])?)\s*(?P<num>\d+)(?:을|를)?\s*(?P<verb>얻|잃)', text):
+        candidates.append({'template': 'TERM_NUM_VERB', 'term_ko': _clean_ko_term(m.group('term')), 'span_ko': m.group(0)})
+    # 스킬 주사위 1개를 소진합니다 / 사용 가능한 스킬 주사위 2개를 소진해야 합니다
+    for m in re.finditer(r'(?P<term>(?:사용 가능한\s+)?(?:[가-힣A-Za-z_]+\s+){0,2}주사위)\s*(?P<num>\d+)개(?:를)?\s*소진', text):
+        candidates.append({'template': 'TERM_NUM_COUNTER_VERB', 'term_ko': _clean_ko_term(m.group('term')), 'span_ko': m.group(0)})
+    # 1개 스킬 주사위를 소진합니다
+    for m in re.finditer(r'(?P<num>\d+)개\s*(?P<term>(?:사용 가능한\s+)?(?:[가-힣A-Za-z_]+\s+){0,2}주사위)(?:를)?\s*소진', text):
+        candidates.append({'template': 'NUM_COUNTER_TERM_VERB', 'term_ko': _clean_ko_term(m.group('term')), 'span_ko': m.group(0)})
+    return [c for c in candidates if c.get('term_ko')]
+
+
+def _select_quantity_ko_candidate(source_obs: dict, ko: str) -> dict | None:
+    candidates = _quantity_ko_candidates(ko)
+    if not candidates:
+        return None
+    family = source_obs.get('source_family')
+    term_source = source_obs.get('term_source', '')
+    if family == 'EXHAUST_NUM_TERM' or 'dice' in term_source:
+        dice_candidates = [c for c in candidates if '주사위' in c.get('term_ko', '')]
+        return dice_candidates[0] if dice_candidates else None
+    if family == 'GAIN_LOSE_NUM_TERM':
+        non_dice = [c for c in candidates if '주사위' not in c.get('term_ko', '')]
+        return non_dice[0] if non_dice else None
+    return candidates[0]
+
+
+def _build_quantity_term_patterns(contexts: list[dict]) -> dict:
+    grouped: dict[str, dict] = {}
+    for c in contexts:
+        for source_obs in _quantity_source_observations(c.get('source_text', '')):
+            ko_obs = _select_quantity_ko_candidate(source_obs, c.get('current_ko', ''))
+            if not ko_obs:
+                template = '<unclassified>'
+                term_ko = '<missing>'
+                span_ko = ''
+            else:
+                template = ko_obs['template']
+                term_ko = ko_obs['term_ko']
+                span_ko = ko_obs.get('span_ko', '')
+            entry = grouped.setdefault(source_obs['index_key'], {
+                'source_family': source_obs['source_family'],
+                'term_source': source_obs['term_source'],
+                'variants': defaultdict(list),
+                'term_ko_variants': defaultdict(list),
+                'examples': [],
+            })
+            entry['variants'][template].append(c['code'])
+            entry['term_ko_variants'][term_ko].append(c['code'])
+            entry['examples'].append({'card_id': c['code'], 'template': template, 'term_ko': term_ko, 'span_ko': span_ko})
+    out = {}
+    for key, entry in grouped.items():
+        template_counts = Counter({k: len(v) for k, v in entry['variants'].items()})
+        dominant_template, dominant_count, confidence = _dominant(template_counts)
+        term_counts = Counter({k: len(v) for k, v in entry['term_ko_variants'].items() if k != '<missing>'})
+        term_ko_dominant, _, term_confidence = _dominant(term_counts)
+        total_count = sum(template_counts.values())
+        out[key] = {
+            'source_family': entry['source_family'],
+            'term_source': entry['term_source'],
+            'term_ko_dominant': term_ko_dominant,
+            'term_ko_confidence': term_confidence,
+            'dominant_template': dominant_template,
+            'dominant_count': dominant_count,
+            'total_count': total_count,
+            'confidence': confidence,
+            'variants': {k: v for k, v in entry['variants'].items()},
+            'term_ko_variants': {k: v for k, v in entry['term_ko_variants'].items()},
+            'examples': entry['examples'][:10],
+        }
+    return out
+
+
 def _build_cross_card_consistency_index(run_id: str, contexts: list[dict], scope: str) -> dict:
     choice_icons = {}
     icon_source_cards = defaultdict(list)
@@ -379,6 +511,7 @@ def _build_cross_card_consistency_index(run_id: str, contexts: list[dict], scope
             'confidence': confidence,
             'variants': {k: v for k, v in variants.items()},
         }
+    quantity_term_patterns = _build_quantity_term_patterns(contexts)
     return {
         'run_id': run_id,
         'created_at': now_iso(),
@@ -386,6 +519,7 @@ def _build_cross_card_consistency_index(run_id: str, contexts: list[dict], scope
         'choice_icons': choice_icons,
         'terms': terms,
         'syntax_structures': syntax_structures,
+        'quantity_term_patterns': quantity_term_patterns,
         'quality': {
             'created_from_batch_contexts': True,
             'card_count': len(contexts),
@@ -394,6 +528,7 @@ def _build_cross_card_consistency_index(run_id: str, contexts: list[dict], scope
             'choice_icon_unique_cards': len({card for entry in choice_icons.values() for card in entry.get('source_cards_unique', [])}),
             'term_count': len(terms),
             'syntax_structure_count': len(syntax_structures),
+            'quantity_term_pattern_count': len(quantity_term_patterns),
             'duplicate_icon_card_entries': duplicate_icon_card_entries,
             'memory_updates_applied': False,
         }
@@ -419,6 +554,19 @@ def _write_index_md(path: Path, title: str, index: dict) -> None:
             lines += ['## Syntax structures']
             for pattern, entry in sorted(index.get('syntax_structures', {}).items()):
                 lines += [f'### {pattern}', f"- dominant_template: {entry.get('dominant_template')}", f"- confidence: {entry.get('confidence')}", f"- variants: `{json.dumps(entry.get('variants', {}), ensure_ascii=False)}`", '']
+        if index.get('quantity_term_patterns'):
+            lines += ['## Quantity term patterns']
+            for key, entry in sorted(index.get('quantity_term_patterns', {}).items()):
+                lines += [
+                    f'### {key}',
+                    f"- source_family: {entry.get('source_family')}",
+                    f"- term_source: {entry.get('term_source')}",
+                    f"- term_ko_dominant: {entry.get('term_ko_dominant')}",
+                    f"- dominant_template: {entry.get('dominant_template')}",
+                    f"- confidence: {entry.get('confidence')}",
+                    f"- variants: `{json.dumps(entry.get('variants', {}), ensure_ascii=False)}`",
+                    '',
+                ]
     path.write_text('\n'.join(lines), encoding='utf-8')
 
 def build_batch_indexes(run_id: str, contexts: list[dict], out: Path, scope: str) -> dict:
@@ -461,7 +609,7 @@ def build_batch_indexes(run_id: str, contexts: list[dict], out: Path, scope: str
     }
 
 def build_qa_json(context: dict) -> dict:
-    return {'card_id':context['code'],'item_id':context['item_id'],'run_id':context['run_id'],'category':context['category'],'source_file':context['source_file'],'translation_file':context['translation_file'],'pipeline_steps':pipeline_steps(context),'step_quality':build_step_quality(context),'agent_trace':context['agent_trace'],'agent_results':context['agent_results'],'llm_usage':context.get('llm_usage',{}),'source_text':context['source_text'],'current_ko':context['current_ko'],'polished_ko':context.get('polished_ko'),'translation_comparison':context.get('translation_comparison',{}),'context_summary':context['context_summary'],'semantic_ir':context.get('semantic_ir',{}),'source_analysis':context['source_analysis'],'translation_slot_result':context['translation_slot_result'],'source_quality_issues':context.get('source_quality_issues',[]),'expected_seed_slots':context.get('expected_seed_slots'),'slot_extraction_quality':context.get('slot_extraction_quality'),'terminology_result':context['terminology_result'],'ontology_result':context['ontology_result'],'patch_result':context['patch_result'],'syntax_pattern_result':context['syntax_pattern_result'],'style_pattern_checks':context.get('style_pattern_checks',[]),'style_learning_quality':context.get('style_learning_quality',{}),'learned_rule_candidates':context.get('learned_rule_candidates',[]),'cross_card_consistency':context['cross_card_consistency'],'readability_exception':context.get('readability_exception'),'rules_lawyer_result':context['rules_lawyer_result'],'im_not_ai_result':context.get('im_not_ai_result',{}),'issues':context['issues'],'suggested_ko':context['suggested_ko'],'final_translation':context['final_translation'],'self_verification':context['self_verification'],'qa_reviewer_result':context.get('qa_reviewer_result',{}),'score':context['score'],'verdict':context['verdict'],'requires_human_review':context['requires_human_review'],'auto_apply':False,'memory_updates_applied':False,'output_type':'suggestion_only','learning_update_proposal':context['learning_update_proposal']}
+    return {'card_id':context['code'],'item_id':context['item_id'],'run_id':context['run_id'],'category':context['category'],'source_file':context['source_file'],'translation_file':context['translation_file'],'pipeline_steps':pipeline_steps(context),'step_quality':build_step_quality(context),'agent_trace':context['agent_trace'],'agent_results':context['agent_results'],'llm_usage':context.get('llm_usage',{}),'source_text':context['source_text'],'current_ko':context['current_ko'],'polished_ko':context.get('polished_ko'),'translation_comparison':context.get('translation_comparison',{}),'context_summary':context['context_summary'],'semantic_ir':context.get('semantic_ir',{}),'source_analysis':context['source_analysis'],'translation_slot_result':context['translation_slot_result'],'source_quality_issues':context.get('source_quality_issues',[]),'expected_seed_slots':context.get('expected_seed_slots'),'slot_extraction_quality':context.get('slot_extraction_quality'),'terminology_result':context['terminology_result'],'ontology_result':context['ontology_result'],'patch_result':context['patch_result'],'syntax_pattern_result':context['syntax_pattern_result'],'style_pattern_checks':context.get('style_pattern_checks',[]),'style_learning_quality':context.get('style_learning_quality',{}),'learned_rule_candidates':context.get('learned_rule_candidates',[]),'cross_card_consistency':context['cross_card_consistency'],'readability_exception':context.get('readability_exception'),'rules_lawyer_result':context['rules_lawyer_result'],'im_not_ai_result':context.get('im_not_ai_result',{}),'issues':context['issues'],'suggested_ko':context['suggested_ko'],'final_translation':context['final_translation'],'self_verification':context['self_verification'],'qa_reviewer_result':context.get('qa_reviewer_result',{}),'harness_meta_audit':context.get('harness_meta_audit',{}),'score':context['score'],'verdict':context['verdict'],'requires_human_review':context['requires_human_review'],'auto_apply':False,'memory_updates_applied':False,'output_type':'suggestion_only','learning_update_proposal':context['learning_update_proposal']}
 
 def build_qa_md(qa: dict) -> str:
     lines=[]
@@ -524,11 +672,15 @@ def build_qa_md(qa: dict) -> str:
             f"- requires_human_review: {im.get('requires_human_review')}",
         ]
         for check in im.get('checks', []):
-            lines.append(f"  - {check.get('check_id')}: {check.get('status')} — {check.get('evidence')}")
+            if isinstance(check, dict):
+                lines.append(f"  - {check.get('check_id')}: {check.get('status')} — {check.get('evidence')}")
+            else:
+                lines.append(f"  - note: {check}")
     else:
         lines.append('- 없음')
     lines += ['','## 제안 번역/수정',qa['suggested_ko'],'','## self-verification','```json',json.dumps(qa['self_verification'], ensure_ascii=False, indent=2),'```']
-    lines += ['','## qa-reviewer final synthesis','```json',json.dumps(qa.get('qa_reviewer_result', {}), ensure_ascii=False, indent=2),'```','','## 학습 반영 제안']
+    lines += ['','## qa-reviewer final synthesis','```json',json.dumps(qa.get('qa_reviewer_result', {}), ensure_ascii=False, indent=2),'```']
+    lines += ['','## harness meta-audit','```json',json.dumps(qa.get('harness_meta_audit', {}), ensure_ascii=False, indent=2),'```','','## 학습 반영 제안']
     if qa['learning_update_proposal']:
         for p in qa['learning_update_proposal']: lines.append(f"- {p['type']}: {p['issue_id']} / {p['proposal']} (승인 필요)")
     else: lines.append('- 없음')
@@ -536,7 +688,7 @@ def build_qa_md(qa: dict) -> str:
 
 def write_run_review_files(out: Path, run_id: str, items: list[dict]) -> None:
     review = out / 'review'; review.mkdir(parents=True, exist_ok=True)
-    files = {'human_review_queue.jsonl': [],'learning_update_proposals.jsonl': [],'pattern_update_proposals.jsonl': [],'glossary_update_proposals.jsonl': [],'regression_update_proposals.jsonl': [],'source_pdf_check_queue.jsonl': [],'source_text_issue_queue.jsonl': [],'lore_ontology_review_queue.jsonl': [],'patch_note_review_queue.jsonl': []}
+    files = {'human_review_queue.jsonl': [],'learning_update_proposals.jsonl': [],'pattern_update_proposals.jsonl': [],'glossary_update_proposals.jsonl': [],'regression_update_proposals.jsonl': [],'source_pdf_check_queue.jsonl': [],'source_text_issue_queue.jsonl': [],'lore_ontology_review_queue.jsonl': [],'patch_note_review_queue.jsonl': [],'meta_harness_review_queue.jsonl': []}
     for item in items:
         code = item['code']
         qa_path = out / 'output' / 'qa_json' / f'{code}.qa.json'
@@ -565,6 +717,8 @@ def write_run_review_files(out: Path, run_id: str, items: list[dict]) -> None:
                 files['lore_ontology_review_queue.jsonl'].append(row)
             if route == 'patch_note_review':
                 files['patch_note_review_queue.jsonl'].append(row)
+            if route == 'meta_harness_review' or proposal.get('meta_audit_candidate') or ptype == 'harness_meta_gap':
+                files['meta_harness_review_queue.jsonl'].append(row)
     for name, rows in files.items():
         path = review / name
         path.write_text(''.join(json.dumps(r, ensure_ascii=False)+'\n' for r in rows), encoding='utf-8')

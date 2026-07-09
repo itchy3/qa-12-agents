@@ -87,12 +87,131 @@ def _term_checks(context: dict, index: dict) -> list[dict]:
     return checks
 
 
+def _norm_source_term(term: str) -> str:
+    term = re.sub(r'\bavailable\b', ' ', (term or '').lower())
+    term = re.sub(r'\b(skill) die\b', r'\1 dice', term)
+    term = re.sub(r'\bdie\b', 'dice', term)
+    term = re.sub(r'[^a-z0-9 ]+', ' ', term)
+    return re.sub(r'\s+', ' ', term).strip()
+
+
+def _quantity_source_observations(source: str) -> list[dict]:
+    text = ' '.join((source or '').split())
+    observations = []
+    for m in re.finditer(r'\b(?:gain|gains|lose|loses)\s+(?P<num>\d+)\s+(?P<term>[A-Za-z][A-Za-z -]*?)(?=\.|,|;| and | or |$)', text, re.I):
+        term = _norm_source_term(m.group('term'))
+        if term:
+            observations.append({'source_family': 'GAIN_LOSE_NUM_TERM', 'term_source': term, 'index_key': f'GAIN_LOSE_NUM_TERM::{term}'})
+    for m in re.finditer(r'\bexhaust\s+(?:(?P<num>\d+)\s+)?(?P<term>(?:available\s+)?[A-Za-z][A-Za-z -]*?(?:die|dice))\b', text, re.I):
+        term = _norm_source_term(m.group('term'))
+        if term:
+            observations.append({'source_family': 'EXHAUST_NUM_TERM', 'term_source': term, 'index_key': f'EXHAUST_NUM_TERM::{term}'})
+    seen = set()
+    out = []
+    for obs in observations:
+        if obs['index_key'] in seen:
+            continue
+        seen.add(obs['index_key'])
+        out.append(obs)
+    return out
+
+
+def _clean_ko_term(term: str) -> str:
+    term = re.sub(r'\[\[[^]|]+\|([^]]+)\]\]', r'\1', term or '')
+    term = re.sub(r'\[\[([^]]+)\]\]', r'\1', term)
+    term = re.sub(r'\b(?:사용 가능한|각|모든|아무|해당)\b', ' ', term)
+    term = re.sub(r'\s+', ' ', term).strip(' .,:;')
+    term = re.sub(r'(?:을|를|이|가|은|는)$', '', term)
+    if '스킬 주사위' in term:
+        m = re.search(r'((?:전투|궁술|중갑|그림자|곡예술|데이드라 소환술)\s+스킬 주사위)$', term)
+        term = m.group(1).strip() if m else '스킬 주사위'
+    elif '주사위' in term:
+        m = re.search(r'((?:[가-힣A-Za-z_]+\s+){0,1}[가-힣A-Za-z_]*주사위)$', term)
+        if m:
+            term = m.group(1).strip()
+    return term
+
+
+def _quantity_ko_candidates(ko: str) -> list[dict]:
+    text = ' '.join((ko or '').split())
+    candidates = []
+    for m in re.finditer(r'(?P<num>\d+)\s*(?P<term>(?:\[\[[^]|]+\|)?(?![을를이가은는]\s)[가-힣A-Za-z_]{2,}(?:\]\])?)(?:을|를)?\s*(?P<verb>얻|잃)', text):
+        candidates.append({'template': 'NUM_TERM_VERB', 'term_ko': _clean_ko_term(m.group('term')), 'span_ko': m.group(0)})
+    for m in re.finditer(r'(?P<term>(?:\[\[[^]|]+\|)?(?![을를이가은는]\s)[가-힣A-Za-z_]{2,}(?:\]\])?)\s*(?P<num>\d+)(?:을|를)?\s*(?P<verb>얻|잃)', text):
+        candidates.append({'template': 'TERM_NUM_VERB', 'term_ko': _clean_ko_term(m.group('term')), 'span_ko': m.group(0)})
+    for m in re.finditer(r'(?P<term>(?:사용 가능한\s+)?(?:[가-힣A-Za-z_]+\s+){0,2}주사위)\s*(?P<num>\d+)개(?:를)?\s*소진', text):
+        candidates.append({'template': 'TERM_NUM_COUNTER_VERB', 'term_ko': _clean_ko_term(m.group('term')), 'span_ko': m.group(0)})
+    for m in re.finditer(r'(?P<num>\d+)개\s*(?P<term>(?:사용 가능한\s+)?(?:[가-힣A-Za-z_]+\s+){0,2}주사위)(?:를)?\s*소진', text):
+        candidates.append({'template': 'NUM_COUNTER_TERM_VERB', 'term_ko': _clean_ko_term(m.group('term')), 'span_ko': m.group(0)})
+    return [c for c in candidates if c.get('term_ko')]
+
+
+def _select_quantity_ko_candidate(source_obs: dict, ko: str) -> dict | None:
+    candidates = _quantity_ko_candidates(ko)
+    if not candidates:
+        return None
+    family = source_obs.get('source_family')
+    term_source = source_obs.get('term_source', '')
+    if family == 'EXHAUST_NUM_TERM' or 'dice' in term_source:
+        dice_candidates = [c for c in candidates if '주사위' in c.get('term_ko', '')]
+        return dice_candidates[0] if dice_candidates else None
+    if family == 'GAIN_LOSE_NUM_TERM':
+        non_dice = [c for c in candidates if '주사위' not in c.get('term_ko', '')]
+        return non_dice[0] if non_dice else None
+    return candidates[0]
+
+
+def _quantity_term_pattern_checks(context: dict, index: dict) -> list[dict]:
+    checks = []
+    patterns = index.get('quantity_term_patterns') or {}
+    if not patterns:
+        return checks
+    for source_obs in _quantity_source_observations(context.get('source_text', '')):
+        entry = patterns.get(source_obs['index_key'])
+        if not entry:
+            continue
+        ko_obs = _select_quantity_ko_candidate(source_obs, context.get('current_ko', ''))
+        current_template = ko_obs.get('template') if ko_obs else '<unclassified>'
+        current_term_ko = ko_obs.get('term_ko') if ko_obs else '<missing>'
+        span_ko = ko_obs.get('span_ko') if ko_obs else ''
+        dominant = entry.get('dominant_template')
+        confidence = float(entry.get('confidence') or 0.0)
+        evidence_count = int(entry.get('total_count') or sum(len(v) for v in (entry.get('variants') or {}).values()))
+        evidence_strength = _evidence_strength(evidence_count, confidence)
+        status = 'pass' if current_template == dominant else 'warn'
+        checks.append({
+            'check_type': 'quantity_term_pattern_consistency',
+            'index_key': source_obs['index_key'],
+            'source_family': source_obs['source_family'],
+            'term_source': source_obs['term_source'],
+            'term_ko_dominant': entry.get('term_ko_dominant'),
+            'current_term_ko': current_term_ko,
+            'span_ko': span_ko,
+            'current_template': current_template,
+            'dominant_template': dominant,
+            'variants': entry.get('variants', {}),
+            'term_ko_variants': entry.get('term_ko_variants', {}),
+            'confidence': confidence,
+            'evidence_count': evidence_count,
+            'evidence_strength': evidence_strength,
+            'status': status,
+            'status_reason': 'matches_quantity_term_dominant_template' if status == 'pass' else 'differs_from_quantity_term_dominant_template',
+            'severity': 'StyleWarning',
+            'meaning_equivalent': True,
+            'requires_human_review': status != 'pass',
+            'issue_id': f"{context['code']}-QTY-TERM-PATTERN-{re.sub(r'[^A-Z0-9]+', '_', source_obs['index_key'].upper()).strip('_')}",
+        })
+    return checks
+
+
 def _source_syntax_pattern(source: str) -> str:
     lower = ' '.join((source or '').lower().split())
     if re.search(r'attack an enemy (?:\d+|once|twice|three|four|five) times?', lower):
         return 'Attack an enemy N times'
     if re.search(r'recover \d+ health \d+ times', lower):
         return 'Recover N health M times'
+    if re.search(r'\b(?:gain|gains|lose|loses)\s+\d+\s+[a-z][a-z -]*\b', lower):
+        return 'Gain/Lose N TERM'
     if re.search(r'use\s+(?:the|this|that|an?|your)?\s*[a-z][a-z\s-]*?\s+\d+\s+times?', lower):
         return 'VERB OBJECT N times'
     return ''
@@ -110,6 +229,11 @@ def _ko_syntax_template(ko: str, source_pattern: str) -> str:
             return 'OBJ_COUNT_VERB'
         if re.search(r'\d+번 체력 \d+을 회복', text):
             return 'COUNT_OBJ_VERB'
+    if source_pattern == 'Gain/Lose N TERM':
+        if re.search(r'\d+\s*(?:\[\[[^]|]+\|)?(?![을를이가은는]\s)[가-힣A-Za-z_]{2,}(?:\]\])?(?:을|를)?\s*(?:얻|잃)', text):
+            return 'NUM_TERM_VERB'
+        if re.search(r'(?:\[\[[^]|]+\|)?(?![을를이가은는]\s)[가-힣A-Za-z_]{2,}(?:\]\])?\s*\d+(?:을|를)?\s*(?:얻|잃)', text):
+            return 'TERM_NUM_VERB'
     if source_pattern == 'VERB OBJECT N times':
         if re.search(r'[가-힣A-Za-z0-9_\s]+(?:을|를)\s*\d+번\s*(?:반복해\s*)?사용', text):
             return 'OBJ_COUNT_VERB'
@@ -210,6 +334,7 @@ def _quality(index: dict, source_syntax_index: dict, checks: list[dict]) -> dict
             'choice_icon_unique_cards': index_quality.get('choice_icon_unique_cards', len({card for entry in (index.get('choice_icons') or {}).values() for card in (entry.get('source_cards_unique') or entry.get('source_cards') or [])})),
             'terms': len((index.get('terms') or {})),
             'syntax_structures': len((index.get('syntax_structures') or {})),
+            'quantity_term_patterns': len((index.get('quantity_term_patterns') or {})),
             'source_syntax_patterns': len((source_syntax_index.get('patterns') or {})),
         },
         'warnings': [] if source_syntax_index else ['source_syntax_pattern_index_not_available'],
@@ -224,6 +349,7 @@ def run(context):
     checks.extend(_choice_icon_checks(context, index))
     checks.extend(_term_checks(context, index))
     checks.extend(_syntax_structure_checks(context, index))
+    checks.extend(_quantity_term_pattern_checks(context, index))
     checks.extend(_syntax_corpus_checks(context, source_syntax_index))
     has_major = any(x.get('severity') == 'Major' for x in context['facts'].get('issues', []))
     has_warn = has_major or any(c.get('status') == 'warn' or c.get('requires_human_review') for c in checks)

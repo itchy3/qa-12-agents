@@ -43,6 +43,8 @@ def _markup_tokens(text: str) -> set[str]:
 
 def _markup_pass(context: dict, im_not_ai: dict) -> bool:
     for check in im_not_ai.get('checks', []):
+        if not isinstance(check, dict):
+            continue
         if check.get('check_id') == 'markup_tokens_preserved' and check.get('status') == 'fail':
             return False
     comparison = context.get('translation_comparison', {})
@@ -56,6 +58,9 @@ def _markup_pass(context: dict, im_not_ai: dict) -> bool:
 def _issue_has_sufficient_evidence(issue: dict) -> bool:
     if issue.get('llm_disputed') or issue.get('review_status') == 'llm_resolved_unresolved_human_review':
         return True
+    text = _issue_text(issue)
+    if any(kind in text for kind in ('metadata', 'frontmatter', 'code mismatch', 'filename')):
+        return bool(issue.get('evidence') and (issue.get('span_ko') or issue.get('span_source')))
     semantic_diff = issue.get('semantic_diff')
     has_source_span = bool(issue.get('span_source') or issue.get('source_span'))
     has_ko_span_or_missing = bool(issue.get('span_ko') or issue.get('ko_span') or (isinstance(semantic_diff, dict) and semantic_diff.get('ko_value') == 'missing'))

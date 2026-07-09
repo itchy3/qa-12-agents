@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -124,9 +125,20 @@ def call_json(agent_name: str, prompt: str, expected_keys: list[str] | None = No
             _validate(data, expected_keys)
             return {'usage': usage, 'data': data}
 
+        provider = (os.environ.get('QA_LLM_PROVIDER') or 'openai-compatible').lower()
+        model = os.environ.get('QA_LLM_MODEL')
+        if provider == 'hermes-cli':
+            if not model:
+                usage['error'] = 'missing_model'
+                return {'usage': usage, 'data': None}
+            raw = _hermes_cli_completion(model, prompt)
+            usage.update({'used': True, 'output_chars': len(raw)})
+            data = _parse_json(raw)
+            _validate(data, expected_keys)
+            return {'usage': usage, 'data': data}
+
         api_key = os.environ.get('QA_LLM_API_KEY') or os.environ.get('OPENAI_API_KEY') or os.environ.get('OPENROUTER_API_KEY')
         base_url = os.environ.get('QA_LLM_BASE_URL') or os.environ.get('OPENAI_BASE_URL') or 'https://api.openai.com/v1'
-        model = os.environ.get('QA_LLM_MODEL')
         if not api_key or not model:
             usage['error'] = 'missing_api_key_or_model'
             return {'usage': usage, 'data': None}
@@ -142,6 +154,26 @@ def call_json(agent_name: str, prompt: str, expected_keys: list[str] | None = No
 
 def record_usage(context: dict, agent_name: str, usage: dict) -> None:
     context.setdefault('llm_usage', {})[agent_name] = usage
+
+
+def _hermes_cli_completion(model: str, prompt: str) -> str:
+    provider = os.environ.get('QA_LLM_HERMES_PROVIDER')
+    timeout = int(os.environ.get('QA_LLM_TIMEOUT_SECONDS', str(DEFAULT_TIMEOUT)))
+    instruction = 'Return strict JSON only. Do not include markdown or explanation.\n\n' + prompt
+    cmd = ['hermes', 'chat', '-q', instruction, '-Q', '-m', model]
+    if provider:
+        cmd.extend(['--provider', provider])
+    proc = subprocess.run(
+        cmd,
+        input='',
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+        env=os.environ.copy(),
+    )
+    if proc.returncode != 0:
+        raise LlmJsonError(f'hermes_cli_exit_{proc.returncode}: {proc.stderr.strip() or proc.stdout.strip()}')
+    return proc.stdout
 
 
 def _chat_completion(base_url: str, api_key: str, model: str, prompt: str) -> str:

@@ -11,8 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-PROJECT = Path(__file__).resolve().parents[2]
-QA_ROOT = PROJECT / 'qa'
+QA_ROOT = Path(__file__).resolve().parents[1]
+PROJECT = QA_ROOT.parent
 DEFAULT_PDF = QA_ROOT / 'rulebook' / 'rulebook.pdf'
 DEFAULT_OUT = QA_ROOT / 'indexes' / 'rulebook'
 
